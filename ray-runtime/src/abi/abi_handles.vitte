@@ -1,0 +1,718 @@
+module ray.runtime.abi.abi_errors
+
+# ============================================================================
+# ray-runtime/src/abi/abi_errors.vitte — ABI error model (MAX, struct-only)
+#
+# Objectifs:
+#   - Modèle d’erreurs stable, interop C/ABI:
+#       * codes (status) + domaine + classe + sévérité
+#       * record structuré (ctx + ids + provenance)
+#       * mapping POSIX errno / Win32 / HRESULT (normalisation)
+#       * helpers purs (pas d’I/O, pas de strings)
+#       * conventions msg_id stables (outil/IDE fait le rendu)
+#
+# Contraintes:
+#   - pas de logs/print
+#   - ajouter des champs uniquement en fin (compat ABI)
+#   - aucun `{}` ; blocs `.end`
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Aliases ABI
+# ----------------------------------------------------------------------------
+
+type AbiStatus = i32
+type AbiErrno  = i32
+type AbiU8     = u8
+type AbiU16    = u16
+type AbiU32    = u32
+type AbiU64    = u64
+type AbiI64    = i64
+type AbiBool   = bool
+
+const ABI_OK: AbiStatus = 0
+
+# ----------------------------------------------------------------------------
+# Domain / Severity / Class
+# ----------------------------------------------------------------------------
+
+enum AbiErrorDomain
+  Unknown   = 0
+  Runtime   = 1
+  Platform  = 2
+  Alloc     = 3
+  Thread    = 4
+  Sync      = 5
+  Task      = 6
+  Timer     = 7
+  Io        = 8
+  Fs        = 9
+  Net       = 10
+  Dns       = 11
+  Tls       = 12
+  Process   = 13
+  Signal    = 14
+  Plugin    = 15
+  Codec     = 16
+  Parse     = 17
+  Config    = 18
+  Security  = 19
+  Internal  = 20
+.end
+
+enum AbiErrorSeverity
+  Info    = 0
+  Warning = 1
+  Error   = 2
+  Fatal   = 3
+.end
+
+enum AbiErrorClass
+  Unspecified       = 0
+  InvalidArgument   = 1
+  NotFound          = 2
+  AlreadyExists     = 3
+  PermissionDenied  = 4
+  Unsupported       = 5
+  OutOfMemory       = 6
+  ResourceBusy      = 7
+  TimedOut          = 8
+  Canceled          = 9
+  Overflow          = 10
+  WouldBlock        = 11
+  Interrupted       = 12
+  IoFailure         = 13
+  Protocol          = 14
+  Connection        = 15
+  AddrInUse         = 16
+  BrokenPipe        = 17
+  EndOfStream       = 18
+  DataCorruption    = 19
+  IncompatibleAbi   = 20
+  Panic             = 21
+  Deadline          = 22
+  RateLimited       = 23
+  Authentication    = 24
+  Authorization     = 25
+  ParseError        = 26
+  DnsFailure        = 27
+  TlsFailure        = 28
+.end
+
+# ----------------------------------------------------------------------------
+# Normalized status codes (errno-like, negative)
+# ----------------------------------------------------------------------------
+# Notes:
+#   - Conserver stable. Ajout ok, ne jamais renuméroter.
+#   - Inspiré Linux errno, mais indépendant du système.
+
+const ABI_EPERM: AbiStatus      = -1
+const ABI_ENOENT: AbiStatus     = -2
+const ABI_ESRCH: AbiStatus      = -3
+const ABI_EINTR: AbiStatus      = -4
+const ABI_EIO: AbiStatus        = -5
+const ABI_ENXIO: AbiStatus      = -6
+const ABI_E2BIG: AbiStatus      = -7
+const ABI_ENOEXEC: AbiStatus    = -8
+const ABI_EBADF: AbiStatus      = -9
+const ABI_ECHILD: AbiStatus     = -10
+const ABI_EAGAIN: AbiStatus     = -11
+const ABI_ENOMEM: AbiStatus     = -12
+const ABI_EACCES: AbiStatus     = -13
+const ABI_EFAULT: AbiStatus     = -14
+const ABI_EBUSY: AbiStatus      = -16
+const ABI_EEXIST: AbiStatus     = -17
+const ABI_EXDEV: AbiStatus      = -18
+const ABI_ENODEV: AbiStatus     = -19
+const ABI_ENOTDIR: AbiStatus    = -20
+const ABI_EISDIR: AbiStatus     = -21
+const ABI_EINVAL: AbiStatus     = -22
+const ABI_ENFILE: AbiStatus     = -23
+const ABI_EMFILE: AbiStatus     = -24
+const ABI_ENOTTY: AbiStatus     = -25
+const ABI_EFBIG: AbiStatus      = -27
+const ABI_ENOSPC: AbiStatus     = -28
+const ABI_ESPIPE: AbiStatus     = -29
+const ABI_EROFS: AbiStatus      = -30
+const ABI_EMLINK: AbiStatus     = -31
+const ABI_EPIPE: AbiStatus      = -32
+const ABI_EDOM: AbiStatus       = -33
+const ABI_ERANGE: AbiStatus     = -34
+const ABI_EDEADLK: AbiStatus    = -35
+const ABI_ENAMETOOLONG: AbiStatus = -36
+const ABI_ENOLCK: AbiStatus     = -37
+const ABI_ENOSYS: AbiStatus     = -38
+const ABI_ENOTEMPTY: AbiStatus  = -39
+
+const ABI_ELOOP: AbiStatus      = -40
+const ABI_ENOMSG: AbiStatus     = -42
+const ABI_EIDRM: AbiStatus      = -43
+
+const ABI_EPROTO: AbiStatus     = -71
+const ABI_EOVERFLOW: AbiStatus  = -75
+
+const ABI_ENOTSUP: AbiStatus    = -95
+const ABI_EOPNOTSUPP: AbiStatus = -95
+
+const ABI_EADDRINUSE: AbiStatus = -98
+const ABI_ENOTCONN: AbiStatus   = -107
+const ABI_ETIMEDOUT: AbiStatus  = -110
+const ABI_ECONNREFUSED: AbiStatus = -111
+const ABI_EHOSTUNREACH: AbiStatus = -113
+const ABI_EALREADY: AbiStatus   = -114
+const ABI_EINPROGRESS: AbiStatus = -115
+const ABI_ECANCELED: AbiStatus  = -125
+
+# ----------------------------------------------------------------------------
+# Provenance / source type (OS error mapping)
+# ----------------------------------------------------------------------------
+
+enum AbiOsErrorKind
+  None   = 0
+  Posix  = 1   # errno (positive)
+  Win32  = 2   # GetLastError (u32)
+  HResult = 3  # HRESULT (u32)
+.end
+
+# ----------------------------------------------------------------------------
+# Location identifiers (no strings)
+# ----------------------------------------------------------------------------
+# file_id : stable id (hash) du fichier/module
+# line/col : 1-based si dispo, sinon 0
+# span_id : si compilateur/lsp fournit un span stable
+
+struct AbiLocation
+  file_id: AbiU32
+  line: AbiU32
+  col: AbiU32
+  span_id: AbiU64
+.end
+
+fn abi_location_none() -> AbiLocation
+  ret AbiLocation file_id: 0 line: 0 col: 0 span_id: 0 .end
+.end
+
+# ----------------------------------------------------------------------------
+# Error record (ABI stable)
+# ----------------------------------------------------------------------------
+# msg_id:
+#   - identifiant stable (pas de texte)
+#   - résolution via tables côté tooling (LSP/CLI)
+#
+# ctx0..ctx3:
+#   - conventions libres (fd/handle, syscall id, sizes, offsets, tokens, etc.)
+#
+# os_kind + os_code:
+#   - code natif source (errno/Win32/HRESULT) pour debug/interop
+#
+# cause_id:
+#   - chainage léger (id d’une autre erreur en storage, ou 0)
+#
+# NOTE ABI: ajouter de nouveaux champs en fin uniquement.
+
+struct AbiError
+  code: AbiStatus
+  domain: AbiErrorDomain
+  class: AbiErrorClass
+  severity: AbiErrorSeverity
+
+  msg_id: AbiU32
+  flags: AbiU32
+
+  ctx0: AbiU64
+  ctx1: AbiU64
+  ctx2: AbiU64
+  ctx3: AbiU64
+
+  os_kind: AbiOsErrorKind
+  os_code: AbiU32
+
+  location: AbiLocation
+
+  cause_id: AbiU64
+  reserved0: AbiU64
+.end
+
+# Flags
+const ABI_ERR_FLAG_TRANSIENT: AbiU32  = 1 << 0
+const ABI_ERR_FLAG_RETRYABLE: AbiU32  = 1 << 1
+const ABI_ERR_FLAG_OS_ERROR: AbiU32   = 1 << 2
+const ABI_ERR_FLAG_USER: AbiU32       = 1 << 3
+const ABI_ERR_FLAG_PANIC: AbiU32      = 1 << 4
+const ABI_ERR_FLAG_TIMEOUT: AbiU32    = 1 << 5
+const ABI_ERR_FLAG_CANCELED: AbiU32   = 1 << 6
+const ABI_ERR_FLAG_WOULDBLOCK: AbiU32 = 1 << 7
+const ABI_ERR_FLAG_EOF: AbiU32        = 1 << 8
+const ABI_ERR_FLAG_INCOMPAT_ABI: AbiU32 = 1 << 9
+
+# ----------------------------------------------------------------------------
+# Constructors / predicates
+# ----------------------------------------------------------------------------
+
+fn abi_error_ok() -> AbiError
+  ret AbiError
+    code: ABI_OK
+    domain: AbiErrorDomain.Unknown
+    class: AbiErrorClass.Unspecified
+    severity: AbiErrorSeverity.Info
+    msg_id: 0
+    flags: 0
+    ctx0: 0
+    ctx1: 0
+    ctx2: 0
+    ctx3: 0
+    os_kind: AbiOsErrorKind.None
+    os_code: 0
+    location: abi_location_none()
+    cause_id: 0
+    reserved0: 0
+  .end
+.end
+
+fn abi_is_ok(code: AbiStatus) -> AbiBool
+  ret code == ABI_OK
+.end
+
+fn abi_is_err(code: AbiStatus) -> AbiBool
+  ret code < 0
+.end
+
+fn abi_error_make(code: AbiStatus, domain: AbiErrorDomain, class: AbiErrorClass, severity: AbiErrorSeverity, msg_id: AbiU32) -> AbiError
+  ret AbiError
+    code: code
+    domain: domain
+    class: class
+    severity: severity
+    msg_id: msg_id
+    flags: 0
+    ctx0: 0
+    ctx1: 0
+    ctx2: 0
+    ctx3: 0
+    os_kind: AbiOsErrorKind.None
+    os_code: 0
+    location: abi_location_none()
+    cause_id: 0
+    reserved0: 0
+  .end
+.end
+
+fn abi_error_with_ctx(e: AbiError, c0: AbiU64, c1: AbiU64, c2: AbiU64, c3: AbiU64) -> AbiError
+  e.ctx0 = c0
+  e.ctx1 = c1
+  e.ctx2 = c2
+  e.ctx3 = c3
+  ret e
+.end
+
+fn abi_error_with_flags(e: AbiError, flags: AbiU32) -> AbiError
+  e.flags = flags
+  ret e
+.end
+
+fn abi_error_with_os(e: AbiError, kind: AbiOsErrorKind, os_code: AbiU32) -> AbiError
+  e.os_kind = kind
+  e.os_code = os_code
+  ret e
+.end
+
+fn abi_error_with_location(e: AbiError, loc: AbiLocation) -> AbiError
+  e.location = loc
+  ret e
+.end
+
+fn abi_error_with_cause(e: AbiError, cause_id: AbiU64) -> AbiError
+  e.cause_id = cause_id
+  ret e
+.end
+
+# ----------------------------------------------------------------------------
+# msg_id scheme (stable)
+# ----------------------------------------------------------------------------
+# Encoding:
+#   8 bits domain | 8 bits class | 16 bits local
+fn msg_id(domain: AbiErrorDomain, class: AbiErrorClass, local: AbiU32) -> AbiU32
+  let d = (domain as AbiU32) & 0xFF
+  let c = (class as AbiU32) & 0xFF
+  let l = local & 0xFFFF
+  ret (d << 24) | (c << 16) | l
+.end
+
+# Common msg_id constants (samples; étendre au fil du runtime)
+const MSG_RUNTIME_INIT_FAILED: AbiU32   = 0x01010001
+const MSG_RUNTIME_SHUTDOWN_FAILED: AbiU32 = 0x010D0002
+
+const MSG_TASK_SPAWN_FAILED: AbiU32     = 0x06060001
+const MSG_TASK_JOIN_INVALID: AbiU32     = 0x06010002
+const MSG_TASK_CANCELED: AbiU32         = 0x06090003
+
+const MSG_TIMER_SLEEP: AbiU32           = 0x07000001
+const MSG_TIMER_TIMEOUT: AbiU32         = 0x07160002
+
+const MSG_IO_READ: AbiU32               = 0x080D0001
+const MSG_IO_WRITE: AbiU32              = 0x080D0002
+const MSG_IO_EOF: AbiU32                = 0x08120003
+
+const MSG_NET_BIND: AbiU32              = 0x0A100001
+const MSG_NET_CONNECT: AbiU32           = 0x0A0F0002
+const MSG_NET_ACCEPT: AbiU32            = 0x0A0F0003
+
+const MSG_PLUGIN_LOAD: AbiU32           = 0x0F140001
+const MSG_PLUGIN_INCOMPAT: AbiU32       = 0x0F140002
+
+# ----------------------------------------------------------------------------
+# Code -> Class mapping (stable heuristics)
+# ----------------------------------------------------------------------------
+
+fn abi_class_from_code(code: AbiStatus) -> AbiErrorClass
+  if code == ABI_OK
+    ret AbiErrorClass.Unspecified
+  .end
+
+  if code == ABI_EINVAL
+    ret AbiErrorClass.InvalidArgument
+  .end
+  if code == ABI_ENOENT
+    ret AbiErrorClass.NotFound
+  .end
+  if code == ABI_EEXIST
+    ret AbiErrorClass.AlreadyExists
+  .end
+  if code == ABI_EACCES or code == ABI_EPERM
+    ret AbiErrorClass.PermissionDenied
+  .end
+  if code == ABI_ENOSYS or code == ABI_ENOTSUP or code == ABI_EOPNOTSUPP
+    ret AbiErrorClass.Unsupported
+  .end
+  if code == ABI_ENOMEM
+    ret AbiErrorClass.OutOfMemory
+  .end
+  if code == ABI_EBUSY
+    ret AbiErrorClass.ResourceBusy
+  .end
+  if code == ABI_ETIMEDOUT
+    ret AbiErrorClass.TimedOut
+  .end
+  if code == ABI_ECANCELED
+    ret AbiErrorClass.Canceled
+  .end
+  if code == ABI_EOVERFLOW or code == ABI_ERANGE
+    ret AbiErrorClass.Overflow
+  .end
+  if code == ABI_EAGAIN or code == ABI_EINPROGRESS or code == ABI_EALREADY
+    ret AbiErrorClass.WouldBlock
+  .end
+  if code == ABI_EINTR
+    ret AbiErrorClass.Interrupted
+  .end
+  if code == ABI_EIO or code == ABI_EBADF
+    ret AbiErrorClass.IoFailure
+  .end
+  if code == ABI_EPROTO
+    ret AbiErrorClass.Protocol
+  .end
+  if code == ABI_ECONNREFUSED or code == ABI_EHOSTUNREACH or code == ABI_ENOTCONN
+    ret AbiErrorClass.Connection
+  .end
+  if code == ABI_EADDRINUSE
+    ret AbiErrorClass.AddrInUse
+  .end
+  if code == ABI_EPIPE
+    ret AbiErrorClass.BrokenPipe
+  .end
+
+  ret AbiErrorClass.Unspecified
+.end
+
+# ----------------------------------------------------------------------------
+# Code -> Severity mapping
+# ----------------------------------------------------------------------------
+
+fn abi_severity_from_code(code: AbiStatus) -> AbiErrorSeverity
+  if code == ABI_OK
+    ret AbiErrorSeverity.Info
+  .end
+
+  if code == ABI_ENOMEM
+    ret AbiErrorSeverity.Fatal
+  .end
+
+  if code == ABI_EAGAIN or code == ABI_EINTR
+    ret AbiErrorSeverity.Warning
+  .end
+
+  ret AbiErrorSeverity.Error
+.end
+
+# ----------------------------------------------------------------------------
+# Flags inference from code
+# ----------------------------------------------------------------------------
+
+fn abi_flags_from_code(code: AbiStatus) -> AbiU32
+  let mut f: AbiU32 = 0
+
+  if code == ABI_EAGAIN or code == ABI_EINTR
+    f = f | ABI_ERR_FLAG_TRANSIENT
+    f = f | ABI_ERR_FLAG_RETRYABLE
+  .end
+
+  if code == ABI_ETIMEDOUT
+    f = f | ABI_ERR_FLAG_TIMEOUT
+    f = f | ABI_ERR_FLAG_TRANSIENT
+    f = f | ABI_ERR_FLAG_RETRYABLE
+  .end
+
+  if code == ABI_ECANCELED
+    f = f | ABI_ERR_FLAG_CANCELED
+  .end
+
+  if code == ABI_EAGAIN or code == ABI_EINPROGRESS or code == ABI_EALREADY
+    f = f | ABI_ERR_FLAG_WOULDBLOCK
+  .end
+
+  if code == ABI_EPIPE
+    f = f | ABI_ERR_FLAG_TRANSIENT
+  .end
+
+  ret f
+.end
+
+# ----------------------------------------------------------------------------
+# High-level: status -> AbiError (domain-aware)
+# ----------------------------------------------------------------------------
+
+fn abi_error_from_status(code: AbiStatus, domain: AbiErrorDomain, msg: AbiU32) -> AbiError
+  let cls = abi_class_from_code(code)
+  let sev = abi_severity_from_code(code)
+
+  let mut e = abi_error_make(code, domain, cls, sev, msg)
+
+  let flags = abi_flags_from_code(code) | ABI_ERR_FLAG_OS_ERROR
+  e.flags = flags
+
+  ret e
+.end
+
+# Domain wrappers
+fn err_runtime(code: AbiStatus, msg: AbiU32) -> AbiError
+  ret abi_error_from_status(code, AbiErrorDomain.Runtime, msg)
+.end
+
+fn err_platform(code: AbiStatus, msg: AbiU32) -> AbiError
+  ret abi_error_from_status(code, AbiErrorDomain.Platform, msg)
+.end
+
+fn err_alloc(code: AbiStatus, msg: AbiU32) -> AbiError
+  ret abi_error_from_status(code, AbiErrorDomain.Alloc, msg)
+.end
+
+fn err_sync(code: AbiStatus, msg: AbiU32) -> AbiError
+  ret abi_error_from_status(code, AbiErrorDomain.Sync, msg)
+.end
+
+fn err_task(code: AbiStatus, msg: AbiU32) -> AbiError
+  ret abi_error_from_status(code, AbiErrorDomain.Task, msg)
+.end
+
+fn err_timer(code: AbiStatus, msg: AbiU32) -> AbiError
+  ret abi_error_from_status(code, AbiErrorDomain.Timer, msg)
+.end
+
+fn err_io(code: AbiStatus, msg: AbiU32) -> AbiError
+  ret abi_error_from_status(code, AbiErrorDomain.Io, msg)
+.end
+
+fn err_fs(code: AbiStatus, msg: AbiU32) -> AbiError
+  ret abi_error_from_status(code, AbiErrorDomain.Fs, msg)
+.end
+
+fn err_net(code: AbiStatus, msg: AbiU32) -> AbiError
+  ret abi_error_from_status(code, AbiErrorDomain.Net, msg)
+.end
+
+fn err_plugin(code: AbiStatus, msg: AbiU32) -> AbiError
+  let mut e = abi_error_from_status(code, AbiErrorDomain.Plugin, msg)
+  if code == ABI_EOPNOTSUPP or code == ABI_ENOTSUP
+    e.flags = e.flags | ABI_ERR_FLAG_INCOMPAT_ABI
+    e.class = AbiErrorClass.IncompatibleAbi
+  .end
+  ret e
+.end
+
+# ----------------------------------------------------------------------------
+# POSIX errno -> normalized AbiStatus
+# ----------------------------------------------------------------------------
+# errno POSIX attendu POSITIF. On mappe vers -errno quand possible, sinon EIO.
+# Garder heuristique stable.
+
+fn abi_status_from_posix_errno(errno_pos: AbiErrno) -> AbiStatus
+  if errno_pos <= 0
+    ret ABI_EINVAL
+  .end
+
+  # On accepte un sous-ensemble, sinon fallback EIO
+  let e = errno_pos as AbiStatus
+  # Normalisation: code ABI = -errno
+  ret -e
+.end
+
+fn abi_error_from_posix(errno_pos: AbiErrno, domain: AbiErrorDomain, msg: AbiU32) -> AbiError
+  let code = abi_status_from_posix_errno(errno_pos)
+  let mut e = abi_error_from_status(code, domain, msg)
+  e = abi_error_with_os(e, AbiOsErrorKind.Posix, errno_pos as AbiU32)
+  ret e
+.end
+
+# ----------------------------------------------------------------------------
+# Win32 GetLastError -> normalized AbiStatus
+# ----------------------------------------------------------------------------
+# Mapping minimal stable:
+#   - Access denied -> EACCES
+#   - File not found / path not found -> ENOENT
+#   - Already exists -> EEXIST
+#   - Not enough memory -> ENOMEM
+#   - Broken pipe -> EPIPE
+#   - Timeout -> ETIMEDOUT
+#   - Would block / IO pending -> EAGAIN
+#
+# NOTE: codes Win32 = u32
+
+const WIN32_ERROR_SUCCESS: AbiU32 = 0
+const WIN32_ERROR_ACCESS_DENIED: AbiU32 = 5
+const WIN32_ERROR_FILE_NOT_FOUND: AbiU32 = 2
+const WIN32_ERROR_PATH_NOT_FOUND: AbiU32 = 3
+const WIN32_ERROR_ALREADY_EXISTS: AbiU32 = 183
+const WIN32_ERROR_NOT_ENOUGH_MEMORY: AbiU32 = 8
+const WIN32_ERROR_OUTOFMEMORY: AbiU32 = 14
+const WIN32_ERROR_BROKEN_PIPE: AbiU32 = 109
+const WIN32_ERROR_SEM_TIMEOUT: AbiU32 = 121
+const WIN32_ERROR_IO_PENDING: AbiU32 = 997
+const WIN32_ERROR_BUSY: AbiU32 = 170
+
+fn abi_status_from_win32(code: AbiU32) -> AbiStatus
+  if code == WIN32_ERROR_SUCCESS
+    ret ABI_OK
+  .end
+  if code == WIN32_ERROR_ACCESS_DENIED
+    ret ABI_EACCES
+  .end
+  if code == WIN32_ERROR_FILE_NOT_FOUND or code == WIN32_ERROR_PATH_NOT_FOUND
+    ret ABI_ENOENT
+  .end
+  if code == WIN32_ERROR_ALREADY_EXISTS
+    ret ABI_EEXIST
+  .end
+  if code == WIN32_ERROR_NOT_ENOUGH_MEMORY or code == WIN32_ERROR_OUTOFMEMORY
+    ret ABI_ENOMEM
+  .end
+  if code == WIN32_ERROR_BROKEN_PIPE
+    ret ABI_EPIPE
+  .end
+  if code == WIN32_ERROR_SEM_TIMEOUT
+    ret ABI_ETIMEDOUT
+  .end
+  if code == WIN32_ERROR_IO_PENDING
+    ret ABI_EAGAIN
+  .end
+  if code == WIN32_ERROR_BUSY
+    ret ABI_EBUSY
+  .end
+  ret ABI_EIO
+.end
+
+fn abi_error_from_win32(code: AbiU32, domain: AbiErrorDomain, msg: AbiU32) -> AbiError
+  let st = abi_status_from_win32(code)
+  let mut e = abi_error_from_status(st, domain, msg)
+  e = abi_error_with_os(e, AbiOsErrorKind.Win32, code)
+  ret e
+.end
+
+# ----------------------------------------------------------------------------
+# HRESULT -> normalized AbiStatus
+# ----------------------------------------------------------------------------
+# Mapping stable (subset):
+#   - E_ACCESSDENIED -> EACCES
+#   - E_OUTOFMEMORY -> ENOMEM
+#   - E_INVALIDARG -> EINVAL
+#   - E_NOTIMPL -> ENOSYS
+#   - E_ABORT / RPC_E_CALL_CANCELED -> ECANCELED
+#
+# HRESULT stored as u32
+
+const HR_S_OK: AbiU32 = 0x00000000
+const HR_E_FAIL: AbiU32 = 0x80004005
+const HR_E_INVALIDARG: AbiU32 = 0x80070057
+const HR_E_OUTOFMEMORY: AbiU32 = 0x8007000E
+const HR_E_ACCESSDENIED: AbiU32 = 0x80070005
+const HR_E_NOTIMPL: AbiU32 = 0x80004001
+const HR_E_ABORT: AbiU32 = 0x80004004
+const HR_RPC_E_CALL_CANCELED: AbiU32 = 0x80010002
+
+fn abi_status_from_hresult(hr: AbiU32) -> AbiStatus
+  if hr == HR_S_OK
+    ret ABI_OK
+  .end
+  if hr == HR_E_ACCESSDENIED
+    ret ABI_EACCES
+  .end
+  if hr == HR_E_OUTOFMEMORY
+    ret ABI_ENOMEM
+  .end
+  if hr == HR_E_INVALIDARG
+    ret ABI_EINVAL
+  .end
+  if hr == HR_E_NOTIMPL
+    ret ABI_ENOSYS
+  .end
+  if hr == HR_E_ABORT or hr == HR_RPC_E_CALL_CANCELED
+    ret ABI_ECANCELED
+  .end
+  ret ABI_EIO
+.end
+
+fn abi_error_from_hresult(hr: AbiU32, domain: AbiErrorDomain, msg: AbiU32) -> AbiError
+  let st = abi_status_from_hresult(hr)
+  let mut e = abi_error_from_status(st, domain, msg)
+  e = abi_error_with_os(e, AbiOsErrorKind.HResult, hr)
+  ret e
+.end
+
+# ----------------------------------------------------------------------------
+# Convenience: derive from any OS error kind
+# ----------------------------------------------------------------------------
+
+fn abi_error_from_os(kind: AbiOsErrorKind, code: AbiU32, domain: AbiErrorDomain, msg: AbiU32) -> AbiError
+  if kind == AbiOsErrorKind.Posix
+    ret abi_error_from_posix(code as AbiErrno, domain, msg)
+  .end
+  if kind == AbiOsErrorKind.Win32
+    ret abi_error_from_win32(code, domain, msg)
+  .end
+  if kind == AbiOsErrorKind.HResult
+    ret abi_error_from_hresult(code, domain, msg)
+  .end
+  ret abi_error_from_status(ABI_EIO, domain, msg)
+.end
+
+# ----------------------------------------------------------------------------
+# Canonical “EOF” / stream closed helper (no strings)
+# ----------------------------------------------------------------------------
+
+fn abi_error_eof(domain: AbiErrorDomain) -> AbiError
+  let mut e = abi_error_make(ABI_EPIPE, domain, AbiErrorClass.EndOfStream, AbiErrorSeverity.Warning, MSG_IO_EOF)
+  e.flags = e.flags | ABI_ERR_FLAG_EOF
+  ret e
+.end
+
+# ----------------------------------------------------------------------------
+# ABI compatibility helper (plugins / host)
+# ----------------------------------------------------------------------------
+
+fn abi_error_incompat(domain: AbiErrorDomain, expected: AbiU32, got: AbiU32, msg: AbiU32) -> AbiError
+  let mut e = abi_error_make(ABI_EOPNOTSUPP, domain, AbiErrorClass.IncompatibleAbi, AbiErrorSeverity.Error, msg)
+  e.flags = e.flags | ABI_ERR_FLAG_INCOMPAT_ABI
+  e = abi_error_with_ctx(e, expected as AbiU64, got as AbiU64, 0, 0)
+  ret e
+.end
+
+.end

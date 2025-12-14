@@ -1,0 +1,462 @@
+module ray.runtime.bench.b_tcp_throughput
+
+import runtime.core.rt_result as rtres
+import runtime.core.rt_logging as rtlog
+import runtime.time.time_instant as tinst
+import runtime.time.time_duration as tdur
+
+import runtime.executor.exec_builder as execb
+import runtime.executor.exec_runtime as exec
+import runtime.executor.exec_spawn as spawn
+import runtime.task.task_join as join
+
+import runtime.sync.sync_notify as notify
+import runtime.sync.sync_mpsc as mpsc
+
+import runtime.io.io_bytes as iobytes
+import runtime.io.io_buf as iobuf
+import runtime.io.io_copy as iocopy
+
+import runtime.net.net_addr as naddr
+import runtime.net.net_tcp as ntcp
+
+# ============================================================================
+# ray-runtime/bench/b_tcp_throughput.vitte — TCP throughput benchmark (Tokio-like)
+#
+# Objectifs:
+#   - Mesurer débit TCP local (loopback) client->server et server->client
+#   - Mesurer latence "request/response" (optionnel)
+#   - Mesurer overhead async runtime (spawn, reactor, io)
+#
+# Bench modes:
+#   - "upload"   : client -> server (server reads/discards)
+#   - "download" : server -> client (client reads/discards)
+#   - "echo"     : client sends, server echoes (RTT-ish)
+#
+# Résultats:
+#   - bytes/s, ns/MB, ns/iter
+#
+# Notes:
+#   - APIs TCP sont placeholders: adapter à runtime.net.net_tcp réel
+#   - Aucun `{}`. Blocs `.end`.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Types
+# ----------------------------------------------------------------------------
+
+struct TcpBenchConfig
+  name: str                 # upload|download|echo
+  warmup_iters: u64
+  iters: u64                # number of chunks/messages
+  chunk_bytes: u32
+  total_bytes: u64          # if >0 overrides iters*chunk
+  port: u16                 # 0 => ephemeral
+  workers: u32
+  blocking_threads: u32
+  nodelay: bool
+  reuseaddr: bool
+  verbose: bool
+  json: bool
+.end
+
+struct TcpBenchStats
+  iters: u64
+  bytes_total: u64
+  elapsed_ns: u64
+  bytes_per_sec: u64
+  ns_per_mb: u64
+  ns_per_iter: u64
+.end
+
+enum TcpBenchError
+  InvalidArgs
+  RuntimeInitFailed
+  BindFailed
+  ConnectFailed
+  IoFailed
+.end
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+
+fn now_ns() -> u64
+  let t = tinst.now()
+  ret tinst.to_unix_nanos(t)
+.end
+
+fn bytes_per_sec(bytes: u64, elapsed_ns: u64) -> u64
+  if elapsed_ns == 0
+    ret 0
+  .end
+  ret (bytes * 1_000_000_000) / elapsed_ns
+.end
+
+fn ns_per_mb(bytes: u64, elapsed_ns: u64) -> u64
+  if bytes == 0
+    ret 0
+  .end
+  let mb: u64 = 1_048_576
+  ret (elapsed_ns * mb) / bytes
+.end
+
+fn ns_per_iter(iters: u64, elapsed_ns: u64) -> u64
+  if iters == 0
+    ret 0
+  .end
+  ret elapsed_ns / iters
+.end
+
+fn compute_total(cfg: TcpBenchConfig) -> (u64, u64)
+  # returns (iters, bytes_total)
+  if cfg.total_bytes > 0
+    let bytes = cfg.total_bytes
+    let it = if cfg.chunk_bytes == 0 then 0 else (bytes / (cfg.chunk_bytes as u64)) .end
+    ret (it, bytes)
+  .end
+  let bytes = cfg.iters * (cfg.chunk_bytes as u64)
+  ret (cfg.iters, bytes)
+.end
+
+# ----------------------------------------------------------------------------
+# Runtime init
+# ----------------------------------------------------------------------------
+
+fn build_runtime(cfg: TcpBenchConfig) -> rtres.Result[exec.Runtime, TcpBenchError]
+  let mut b = execb.builder()
+  execb.set_workers(b, cfg.workers)
+  execb.set_blocking_threads(b, cfg.blocking_threads)
+  execb.set_name(b, "ray-tcp-bench")
+  let r = execb.build(b)
+  if rtres.is_err(r)
+    ret rtres.err(TcpBenchError.RuntimeInitFailed)
+  .end
+  ret rtres.ok(rtres.unwrap(r))
+.end
+
+# ----------------------------------------------------------------------------
+# Server tasks
+# ----------------------------------------------------------------------------
+
+fn server_upload(rt: exec.Runtime, listener: ntcp.TcpListener, bytes_target: u64, chunk: u32, ready: notify.Notify) -> u64
+  notify.notify_one(ready)
+
+  let (sock, _peer) = ntcp.accept(listener)
+  ntcp.set_nodelay(sock, true)
+
+  let mut buf = iobytes.bytes_alloc(chunk as u64)
+  let mut read_total: u64 = 0
+
+  while read_total < bytes_target
+    let n = ntcp.read(sock, buf)
+    if n == 0
+      break
+    .end
+    read_total = read_total + (n as u64)
+  .end
+
+  ntcp.close(sock)
+  ret read_total
+.end
+
+fn server_download(rt: exec.Runtime, listener: ntcp.TcpListener, bytes_target: u64, chunk: u32, ready: notify.Notify) -> u64
+  notify.notify_one(ready)
+
+  let (sock, _peer) = ntcp.accept(listener)
+  ntcp.set_nodelay(sock, true)
+
+  let buf = iobytes.bytes_repeat(0x5Au8, chunk as u64)
+
+  let mut sent_total: u64 = 0
+  while sent_total < bytes_target
+    let n = ntcp.write(sock, buf)
+    if n == 0
+      break
+    .end
+    sent_total = sent_total + (n as u64)
+  .end
+
+  ntcp.close(sock)
+  ret sent_total
+.end
+
+fn server_echo(rt: exec.Runtime, listener: ntcp.TcpListener, iters: u64, chunk: u32, ready: notify.Notify) -> u64
+  notify.notify_one(ready)
+
+  let (sock, _peer) = ntcp.accept(listener)
+  ntcp.set_nodelay(sock, true)
+
+  let mut buf = iobytes.bytes_alloc(chunk as u64)
+
+  let mut i: u64 = 0
+  while i < iters
+    let n = ntcp.read_exact(sock, buf)     # placeholder; ensure exactly chunk bytes
+    if n == 0
+      break
+    .end
+    let m = ntcp.write_all(sock, buf)      # placeholder
+    if m == 0
+      break
+    .end
+    i = i + 1
+  .end
+
+  ntcp.close(sock)
+  ret i
+.end
+
+# ----------------------------------------------------------------------------
+# Client side loops
+# ----------------------------------------------------------------------------
+
+fn client_upload(cfg: TcpBenchConfig, rt: exec.Runtime, addr: naddr.SocketAddr, bytes_target: u64, chunk: u32) -> rtres.Result[TcpBenchStats, TcpBenchError]
+  let sock = ntcp.connect(addr)
+  if ntcp.is_invalid(sock)
+    ret rtres.err(TcpBenchError.ConnectFailed)
+  .end
+  ntcp.set_nodelay(sock, cfg.nodelay)
+
+  let buf = iobytes.bytes_repeat(0xA5u8, chunk as u64)
+
+  let start = now_ns()
+  let mut sent_total: u64 = 0
+  while sent_total < bytes_target
+    let n = ntcp.write(sock, buf)
+    if n == 0
+      break
+    .end
+    sent_total = sent_total + (n as u64)
+  .end
+  let end = now_ns()
+
+  ntcp.close(sock)
+
+  let elapsed = end - start
+
+  ret rtres.ok(TcpBenchStats
+    iters: if chunk == 0 then 0 else sent_total / (chunk as u64) .end
+    bytes_total: sent_total
+    elapsed_ns: elapsed
+    bytes_per_sec: bytes_per_sec(sent_total, elapsed)
+    ns_per_mb: ns_per_mb(sent_total, elapsed)
+    ns_per_iter: ns_per_iter(if chunk == 0 then 0 else sent_total / (chunk as u64) .end, elapsed)
+  .end)
+.end
+
+fn client_download(cfg: TcpBenchConfig, rt: exec.Runtime, addr: naddr.SocketAddr, bytes_target: u64, chunk: u32) -> rtres.Result[TcpBenchStats, TcpBenchError]
+  let sock = ntcp.connect(addr)
+  if ntcp.is_invalid(sock)
+    ret rtres.err(TcpBenchError.ConnectFailed)
+  .end
+  ntcp.set_nodelay(sock, cfg.nodelay)
+
+  let mut buf = iobytes.bytes_alloc(chunk as u64)
+
+  let start = now_ns()
+  let mut read_total: u64 = 0
+  while read_total < bytes_target
+    let n = ntcp.read(sock, buf)
+    if n == 0
+      break
+    .end
+    read_total = read_total + (n as u64)
+  .end
+  let end = now_ns()
+
+  ntcp.close(sock)
+
+  let elapsed = end - start
+
+  ret rtres.ok(TcpBenchStats
+    iters: if chunk == 0 then 0 else read_total / (chunk as u64) .end
+    bytes_total: read_total
+    elapsed_ns: elapsed
+    bytes_per_sec: bytes_per_sec(read_total, elapsed)
+    ns_per_mb: ns_per_mb(read_total, elapsed)
+    ns_per_iter: ns_per_iter(if chunk == 0 then 0 else read_total / (chunk as u64) .end, elapsed)
+  .end)
+.end
+
+fn client_echo(cfg: TcpBenchConfig, rt: exec.Runtime, addr: naddr.SocketAddr, iters: u64, chunk: u32) -> rtres.Result[TcpBenchStats, TcpBenchError]
+  let sock = ntcp.connect(addr)
+  if ntcp.is_invalid(sock)
+    ret rtres.err(TcpBenchError.ConnectFailed)
+  .end
+  ntcp.set_nodelay(sock, cfg.nodelay)
+
+  let buf = iobytes.bytes_repeat(0x11u8, chunk as u64)
+  let mut rbuf = iobytes.bytes_alloc(chunk as u64)
+
+  let start = now_ns()
+  let mut i: u64 = 0
+  while i < iters
+    let w = ntcp.write_all(sock, buf)
+    if w == 0
+      break
+    .end
+    let r = ntcp.read_exact(sock, rbuf)
+    if r == 0
+      break
+    .end
+    i = i + 1
+  .end
+  let end = now_ns()
+
+  ntcp.close(sock)
+
+  let elapsed = end - start
+  let bytes_total = i * (chunk as u64) * 2     # send + recv per iter
+
+  ret rtres.ok(TcpBenchStats
+    iters: i
+    bytes_total: bytes_total
+    elapsed_ns: elapsed
+    bytes_per_sec: bytes_per_sec(bytes_total, elapsed)
+    ns_per_mb: ns_per_mb(bytes_total, elapsed)
+    ns_per_iter: ns_per_iter(i, elapsed)
+  .end)
+.end
+
+# ----------------------------------------------------------------------------
+# Main run
+# ----------------------------------------------------------------------------
+
+fn run(cfg: TcpBenchConfig) -> rtres.Result[TcpBenchStats, TcpBenchError]
+  if cfg.chunk_bytes == 0
+    ret rtres.err(TcpBenchError.InvalidArgs)
+  .end
+
+  let rtr = build_runtime(cfg)
+  if rtres.is_err(rtr)
+    ret rtres.err(TcpBenchError.RuntimeInitFailed)
+  .end
+  let rt = rtres.unwrap(rtr)
+
+  let (iters, bytes_target) = compute_total(cfg)
+  if bytes_target == 0 and cfg.name != "echo"
+    ret rtres.err(TcpBenchError.InvalidArgs)
+  .end
+
+  # Bind server on loopback
+  let bind_addr = naddr.loopback_ipv4(cfg.port)       # 127.0.0.1:port
+  let listener = ntcp.bind(bind_addr)
+  if ntcp.is_invalid_listener(listener)
+    ret rtres.err(TcpBenchError.BindFailed)
+  .end
+  ntcp.set_reuseaddr(listener, cfg.reuseaddr)
+
+  let local = ntcp.local_addr(listener)
+
+  # Start server
+  let ready = notify.Notify.new()
+
+  let hs = if cfg.name == "upload"
+    spawn.spawn(rt, fn() -> u64
+      ret server_upload(rt, listener, bytes_target, cfg.chunk_bytes, ready)
+    .end)
+  elif cfg.name == "download"
+    spawn.spawn(rt, fn() -> u64
+      ret server_download(rt, listener, bytes_target, cfg.chunk_bytes, ready)
+    .end)
+  else
+    spawn.spawn(rt, fn() -> u64
+      ret server_echo(rt, listener, iters, cfg.chunk_bytes, ready)
+    .end)
+  .end
+
+  # Wait server ready
+  notify.wait(ready)
+
+  # Warmup (optional)
+  if cfg.warmup_iters > 0
+    let mut wcfg = cfg
+    wcfg.total_bytes = 0
+    wcfg.iters = cfg.warmup_iters
+    wcfg.warmup_iters = 0
+    let _ = if wcfg.name == "upload"
+      client_upload(wcfg, rt, local, wcfg.iters * (wcfg.chunk_bytes as u64), wcfg.chunk_bytes)
+    elif wcfg.name == "download"
+      client_download(wcfg, rt, local, wcfg.iters * (wcfg.chunk_bytes as u64), wcfg.chunk_bytes)
+    else
+      client_echo(wcfg, rt, local, wcfg.iters, wcfg.chunk_bytes)
+    .end
+  .end
+
+  # Measure (client side)
+  let res = if cfg.name == "upload"
+    client_upload(cfg, rt, local, bytes_target, cfg.chunk_bytes)
+  elif cfg.name == "download"
+    client_download(cfg, rt, local, bytes_target, cfg.chunk_bytes)
+  else
+    client_echo(cfg, rt, local, iters, cfg.chunk_bytes)
+  .end
+
+  # Ensure server finishes
+  let _ = join.block_on(rt, hs)
+
+  ret res
+.end
+
+# ----------------------------------------------------------------------------
+# Output
+# ----------------------------------------------------------------------------
+
+fn print_stats(cfg: TcpBenchConfig, s: TcpBenchStats)
+  if cfg.json
+    rtlog.info("bench.json", "TODO")
+    ret
+  .end
+
+  rtlog.info("bench.case", cfg.name)
+  rtlog.info("bench.iters", rtlog.fmt_u64(s.iters))
+  rtlog.info("bench.bytes_total", rtlog.fmt_u64(s.bytes_total))
+  rtlog.info("bench.elapsed_ns", rtlog.fmt_u64(s.elapsed_ns))
+  rtlog.info("bench.bytes_per_sec", rtlog.fmt_u64(s.bytes_per_sec))
+  rtlog.info("bench.ns_per_mb", rtlog.fmt_u64(s.ns_per_mb))
+  rtlog.info("bench.ns_per_iter", rtlog.fmt_u64(s.ns_per_iter))
+.end
+
+# ----------------------------------------------------------------------------
+# Entrypoint
+# ----------------------------------------------------------------------------
+
+fn default_cfg() -> TcpBenchConfig
+  ret TcpBenchConfig
+    name: "upload"
+    warmup_iters: 128
+    iters: 2048
+    chunk_bytes: 64 * 1024
+    total_bytes: 0
+    port: 0
+    workers: 0
+    blocking_threads: 0
+    nodelay: true
+    reuseaddr: true
+    verbose: false
+    json: false
+  .end
+.end
+
+fn main(args: [str]) -> i32
+  let cfg = default_cfg()
+  # TODO parse args:
+  #   --mode upload|download|echo
+  #   --iters N --warmup N
+  #   --chunk BYTES --total BYTES
+  #   --port P
+  #   --workers N --json --verbose
+  #   --nodelay/--no-nodelay
+
+  if cfg.workers == 0
+    cfg.workers = 4
+  .end
+
+  let res = run(cfg)
+  if rtres.is_err(res)
+    rtlog.error("bench.fail", "tcp throughput failed")
+    ret 1
+  .end
+
+  let s = rtres.unwrap(res)
+  print_stats_

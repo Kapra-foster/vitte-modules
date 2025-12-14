@@ -1,0 +1,315 @@
+module ray.runtime.abi.abi_result
+
+import ray.runtime.abi.abi_errors as abie
+
+# ============================================================================
+# ray-runtime/src/abi/abi_result.vitte — ABI Result + payload conventions (MAX)
+#
+# Objectifs:
+#   - Fournir un "Result" ABI stable (style Rust Result<T, E>) sans génériques:
+#       * status code (AbiStatus)
+#       * error record (AbiError) optionnel
+#       * payload union (u64/u32/ptr/handle + 2 slots)
+#   - Standardiser les retours ABI pour runtime C / plugins:
+#       * fonctions "status only"
+#       * fonctions "status + out param"
+#       * fonctions "Result" (struct return) pour FFI simplifiée
+#
+# Contraintes:
+#   - Pure data + helpers (pas d'I/O)
+#   - Compat ABI: ajouter des champs en fin uniquement
+#   - Aucun `{}` ; blocs `.end`
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Aliases
+# ----------------------------------------------------------------------------
+
+type AbiStatus = abie.AbiStatus
+type AbiU8  = u8
+type AbiU16 = u16
+type AbiU32 = u32
+type AbiU64 = u64
+type AbiI32 = i32
+type AbiI64 = i64
+type AbiBool = bool
+
+type AbiPtr = AbiU64     # pointer-as-u64 for ABI (host decides cast)
+type AbiHandle = AbiU64  # opaque handle
+
+const ABI_OK: AbiStatus = abie.ABI_OK
+
+# ----------------------------------------------------------------------------
+# Result tags / payload kinds
+# ----------------------------------------------------------------------------
+
+enum AbiResultTag
+  Ok = 0
+  Err = 1
+.end
+
+enum AbiPayloadKind
+  None   = 0
+  U64    = 1
+  I64    = 2
+  U32    = 3
+  I32    = 4
+  Bool   = 5
+  Ptr    = 6
+  Handle = 7
+  PairU64 = 8
+  PairPtr = 9
+.end
+
+# ----------------------------------------------------------------------------
+# ABI payload (generic slots)
+# ----------------------------------------------------------------------------
+# Convention:
+#   - kind indique l'interprétation des slots
+#   - a/b peuvent contenir:
+#       * u64 scalar
+#       * ptr casté en u64
+#       * handle
+#   - l'appelant peut aussi utiliser out-params; payload devient optionnel.
+
+struct AbiPayload
+  kind: AbiPayloadKind
+  flags: AbiU32
+  a: AbiU64
+  b: AbiU64
+.end
+
+const ABI_PAYLOAD_FLAG_RESERVED0: AbiU32 = 1 << 0
+
+fn payload_none() -> AbiPayload
+  ret AbiPayload kind: AbiPayloadKind.None flags: 0 a: 0 b: 0 .end
+.end
+
+fn payload_u64(v: AbiU64) -> AbiPayload
+  ret AbiPayload kind: AbiPayloadKind.U64 flags: 0 a: v b: 0 .end
+.end
+
+fn payload_i64(v: AbiI64) -> AbiPayload
+  ret AbiPayload kind: AbiPayloadKind.I64 flags: 0 a: v as AbiU64 b: 0 .end
+.end
+
+fn payload_u32(v: AbiU32) -> AbiPayload
+  ret AbiPayload kind: AbiPayloadKind.U32 flags: 0 a: v as AbiU64 b: 0 .end
+.end
+
+fn payload_i32(v: AbiI32) -> AbiPayload
+  ret AbiPayload kind: AbiPayloadKind.I32 flags: 0 a: v as AbiU64 b: 0 .end
+.end
+
+fn payload_bool(v: AbiBool) -> AbiPayload
+  let x: AbiU64 = if v then 1 else 0 .end
+  ret AbiPayload kind: AbiPayloadKind.Bool flags: 0 a: x b: 0 .end
+.end
+
+fn payload_ptr(p: AbiPtr) -> AbiPayload
+  ret AbiPayload kind: AbiPayloadKind.Ptr flags: 0 a: p b: 0 .end
+.end
+
+fn payload_handle(h: AbiHandle) -> AbiPayload
+  ret AbiPayload kind: AbiPayloadKind.Handle flags: 0 a: h b: 0 .end
+.end
+
+fn payload_pair_u64(a: AbiU64, b: AbiU64) -> AbiPayload
+  ret AbiPayload kind: AbiPayloadKind.PairU64 flags: 0 a: a b: b .end
+.end
+
+fn payload_pair_ptr(a: AbiPtr, b: AbiPtr) -> AbiPayload
+  ret AbiPayload kind: AbiPayloadKind.PairPtr flags: 0 a: a b: b .end
+.end
+
+# ----------------------------------------------------------------------------
+# ABI Result structure
+# ----------------------------------------------------------------------------
+# Policy:
+#   - status = ABI_OK si Ok
+#   - status < 0 si Err
+#   - tag redondant mais utile pour languages FFI faibles
+#   - error toujours rempli si Err, sinon "ok record"
+#
+# NOTE: champs additionnels à ajouter en fin seulement.
+
+struct AbiResult
+  tag: AbiResultTag
+  status: AbiStatus
+  error: abie.AbiError
+  payload: AbiPayload
+
+  # Reserved for future:
+  reserved0: AbiU64
+  reserved1: AbiU64
+.end
+
+fn ok() -> AbiResult
+  ret AbiResult
+    tag: AbiResultTag.Ok
+    status: ABI_OK
+    error: abie.abi_error_ok()
+    payload: payload_none()
+    reserved0: 0
+    reserved1: 0
+  .end
+.end
+
+fn ok_payload(p: AbiPayload) -> AbiResult
+  let mut r = ok()
+  r.payload = p
+  ret r
+.end
+
+fn err(e: abie.AbiError) -> AbiResult
+  ret AbiResult
+    tag: AbiResultTag.Err
+    status: e.code
+    error: e
+    payload: payload_none()
+    reserved0: 0
+    reserved1: 0
+  .end
+.end
+
+fn err_status(code: AbiStatus, domain: abie.AbiErrorDomain, msg_id: AbiU32) -> AbiResult
+  let e = abie.abi_error_from_status(code, domain, msg_id)
+  ret err(e)
+.end
+
+fn is_ok(r: AbiResult) -> AbiBool
+  ret r.tag == AbiResultTag.Ok and r.status == ABI_OK
+.end
+
+fn is_err(r: AbiResult) -> AbiBool
+  ret r.tag == AbiResultTag.Err or r.status < 0
+.end
+
+# ----------------------------------------------------------------------------
+# Out-param conventions helpers
+# ----------------------------------------------------------------------------
+# Ces helpers permettent de standardiser un style:
+#   - fn foo(...) -> AbiStatus  + out param
+#   - fn foo(...) -> AbiResult  (struct return)
+#
+# Ici, on formalise surtout les patterns.
+
+struct AbiOutU64
+  ok: AbiBool
+  status: AbiStatus
+  value: AbiU64
+  error: abie.AbiError
+.end
+
+fn out_u64_ok(v: AbiU64) -> AbiOutU64
+  ret AbiOutU64 ok: true status: ABI_OK value: v error: abie.abi_error_ok() .end
+.end
+
+fn out_u64_err(e: abie.AbiError) -> AbiOutU64
+  ret AbiOutU64 ok: false status: e.code value: 0 error: e .end
+.end
+
+# ----------------------------------------------------------------------------
+# Handle results (common in runtime)
+# ----------------------------------------------------------------------------
+
+struct AbiOutHandle
+  ok: AbiBool
+  status: AbiStatus
+  handle: AbiHandle
+  error: abie.AbiError
+.end
+
+fn out_handle_ok(h: AbiHandle) -> AbiOutHandle
+  ret AbiOutHandle ok: true status: ABI_OK handle: h error: abie.abi_error_ok() .end
+.end
+
+fn out_handle_err(e: abie.AbiError) -> AbiOutHandle
+  ret AbiOutHandle ok: false status: e.code handle: 0 error: e .end
+.end
+
+# ----------------------------------------------------------------------------
+# Payload accessors (safe-ish)
+# ----------------------------------------------------------------------------
+
+fn payload_as_u64(p: AbiPayload) -> (AbiBool, AbiU64)
+  if p.kind == AbiPayloadKind.U64
+    ret (true, p.a)
+  .end
+  ret (false, 0)
+.end
+
+fn payload_as_handle(p: AbiPayload) -> (AbiBool, AbiHandle)
+  if p.kind == AbiPayloadKind.Handle
+    ret (true, p.a)
+  .end
+  ret (false, 0)
+.end
+
+fn payload_as_ptr(p: AbiPayload) -> (AbiBool, AbiPtr)
+  if p.kind == AbiPayloadKind.Ptr
+    ret (true, p.a)
+  .end
+  ret (false, 0)
+.end
+
+fn payload_as_pair_u64(p: AbiPayload) -> (AbiBool, AbiU64, AbiU64)
+  if p.kind == AbiPayloadKind.PairU64
+    ret (true, p.a, p.b)
+  .end
+  ret (false, 0, 0)
+.end
+
+# ----------------------------------------------------------------------------
+# Common result builders for runtime subsystems
+# ----------------------------------------------------------------------------
+
+fn ok_handle(h: AbiHandle) -> AbiResult
+  ret ok_payload(payload_handle(h))
+.end
+
+fn ok_u64(v: AbiU64) -> AbiResult
+  ret ok_payload(payload_u64(v))
+.end
+
+fn ok_bool(v: AbiBool) -> AbiResult
+  ret ok_payload(payload_bool(v))
+.end
+
+fn err_runtime(code: AbiStatus, msg: AbiU32) -> AbiResult
+  ret err(abie.err_runtime(code, msg))
+.end
+
+fn err_io(code: AbiStatus, msg: AbiU32) -> AbiResult
+  ret err(abie.err_io(code, msg))
+.end
+
+fn err_net(code: AbiStatus, msg: AbiU32) -> AbiResult
+  ret err(abie.err_net(code, msg))
+.end
+
+# ----------------------------------------------------------------------------
+# Normalize "Ok but payload indicates error" patterns (defensive)
+# ----------------------------------------------------------------------------
+
+fn normalize(r: AbiResult) -> AbiResult
+  if r.tag == AbiResultTag.Ok and r.status != ABI_OK
+    # Incoherent: force Err with synthetic error
+    let e = abie.abi_error_from_status(r.status, abie.AbiErrorDomain.Internal, abie.msg_id(abie.AbiErrorDomain.Internal, abie.AbiErrorClass.Unspecified, 1))
+    ret err(e)
+  .end
+
+  if r.tag == AbiResultTag.Err and r.status == ABI_OK
+    # Incoherent: force status from error.code
+    r.status = r.error.code
+    if r.status == ABI_OK
+      r.status = abie.ABI_EIO
+      r.error = abie.abi_error_from_status(r.status, abie.AbiErrorDomain.Internal, abie.msg_id(abie.AbiErrorDomain.Internal, abie.AbiErrorClass.Unspecified, 2))
+    .end
+    ret r
+  .end
+
+  ret r
+.end
+
+.end

@@ -1,0 +1,14 @@
+module runtime.fs_file
+
+# ============================================================================
+# fs_file.vitte — placeholder
+# generated: 2025-12-14
+#
+# Notes:
+# - Remplir avec ABI structs + impls.
+# - Pas d'I/O implicite; privilégier interfaces de plateforme (platform/*).
+# ============================================================================
+
+# TODO: impl
+
+.end

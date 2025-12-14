@@ -1,0 +1,535 @@
+module ray.runtime.abi.abi_layout
+
+import ray.runtime.abi.abi_errors as abie
+
+# ============================================================================
+# ray-runtime/src/abi/abi_layout.vitte — ABI layout + stable type metadata (MAX)
+#
+# Objectifs:
+#   - Définir des primitives de layout stables (align/size/offset) pour:
+#       * handles, slices, strings, results, errors
+#       * vérification compat ABI (runtime <-> plugins <-> host)
+#   - Fournir des “type descriptors” (sans réflexion lourde) utilisables par:
+#       * loader de plugins
+#       * outillage (bindings, FFI gen)
+#       * tests ABI (layout stable)
+#
+# Contraintes:
+#   - Pure data + helpers (pas d'I/O).
+#   - Ajouts en fin de struct uniquement.
+#   - Aucun `{}` ; blocs `.end`.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic scalar aliases (ABI)
+# ----------------------------------------------------------------------------
+
+type AbiU8  = u8
+type AbiU16 = u16
+type AbiU32 = u32
+type AbiU64 = u64
+type AbiI32 = i32
+type AbiI64 = i64
+type AbiBool = bool
+
+type AbiSize  = AbiU64
+type AbiAlign = AbiU32
+type AbiOff   = AbiU64
+
+const ABI_U64_MAX: AbiU64 = 18446744073709551615
+
+# ----------------------------------------------------------------------------
+# Target model (host/guest) — minimal
+# ----------------------------------------------------------------------------
+
+enum AbiEndian
+  Unknown = 0
+  Little = 1
+  Big = 2
+.end
+
+enum AbiPtrWidth
+  Unknown = 0
+  Ptr32 = 32
+  Ptr64 = 64
+.end
+
+struct AbiTarget
+  ptr_width: AbiPtrWidth
+  endian: AbiEndian
+  os_tag: AbiU32
+  arch_tag: AbiU32
+  abi_version: AbiU32
+  reserved0: AbiU32
+.end
+
+fn abi_target_default() -> AbiTarget
+  ret AbiTarget
+    ptr_width: AbiPtrWidth.Ptr64
+    endian: AbiEndian.Little
+    os_tag: 0
+    arch_tag: 0
+    abi_version: 1
+    reserved0: 0
+  .end
+.end
+
+# ----------------------------------------------------------------------------
+# Layout primitives
+# ----------------------------------------------------------------------------
+
+struct AbiLayout
+  size: AbiSize
+  align: AbiAlign
+.end
+
+fn abi_layout(size: AbiSize, align: AbiAlign) -> AbiLayout
+  ret AbiLayout size: size align: align .end
+.end
+
+fn is_pow2_u32(x: AbiU32) -> AbiBool
+  if x == 0
+    ret false
+  .end
+  ret (x & (x - 1)) == 0
+.end
+
+fn align_up(off: AbiOff, align: AbiAlign) -> AbiOff
+  if align == 0
+    ret off
+  .end
+  let a: AbiOff = align as AbiOff
+  let mask: AbiOff = a - 1
+  ret (off + mask) & ~mask
+.end
+
+fn checked_add_u64(a: AbiU64, b: AbiU64) -> (AbiBool, AbiU64)
+  let s = a + b
+  if s < a
+    ret (false, 0)
+  .end
+  ret (true, s)
+.end
+
+fn checked_mul_u64(a: AbiU64, b: AbiU64) -> (AbiBool, AbiU64)
+  if a == 0 or b == 0
+    ret (true, 0)
+  .end
+  let p = a * b
+  if p / a != b
+    ret (false, 0)
+  .end
+  ret (true, p)
+.end
+
+# ----------------------------------------------------------------------------
+# Field layout computation
+# ----------------------------------------------------------------------------
+
+struct AbiField
+  name_id: AbiU32     # stable id (hash) du champ
+  layout: AbiLayout
+  offset: AbiOff
+.end
+
+struct AbiRecordLayout
+  size: AbiSize
+  align: AbiAlign
+  field_count: AbiU32
+  fields_ptr: AbiU64   # pointer/handle vers table statique (si runtime expose)
+  # For embedded small records:
+  f0: AbiField
+  f1: AbiField
+  f2: AbiField
+  f3: AbiField
+.end
+
+fn abi_record_layout_empty() -> AbiRecordLayout
+  ret AbiRecordLayout
+    size: 0
+    align: 1
+    field_count: 0
+    fields_ptr: 0
+    f0: AbiField name_id: 0 layout: abi_layout(0, 1) offset: 0 .end
+    f1: AbiField name_id: 0 layout: abi_layout(0, 1) offset: 0 .end
+    f2: AbiField name_id: 0 layout: abi_layout(0, 1) offset: 0 .end
+    f3: AbiField name_id: 0 layout: abi_layout(0, 1) offset: 0 .end
+  .end
+.end
+
+fn compute_record_layout_4(l0: AbiLayout, l1: AbiLayout, l2: AbiLayout, l3: AbiLayout) -> AbiRecordLayout
+  # Compute offsets sequentially with alignment.
+  let mut off: AbiOff = 0
+  let mut max_align: AbiAlign = 1
+
+  let o0 = align_up(off, l0.align)
+  off = o0 + l0.size
+  if l0.align > max_align
+    max_align = l0.align
+  .end
+
+  let o1 = align_up(off, l1.align)
+  off = o1 + l1.size
+  if l1.align > max_align
+    max_align = l1.align
+  .end
+
+  let o2 = align_up(off, l2.align)
+  off = o2 + l2.size
+  if l2.align > max_align
+    max_align = l2.align
+  .end
+
+  let o3 = align_up(off, l3.align)
+  off = o3 + l3.size
+  if l3.align > max_align
+    max_align = l3.align
+  .end
+
+  let final_size = align_up(off, max_align)
+
+  ret AbiRecordLayout
+    size: final_size
+    align: max_align
+    field_count: 4
+    fields_ptr: 0
+    f0: AbiField name_id: 1 layout: l0 offset: o0 .end
+    f1: AbiField name_id: 2 layout: l1 offset: o1 .end
+    f2: AbiField name_id: 3 layout: l2 offset: o2 .end
+    f3: AbiField name_id: 4 layout: l3 offset: o3 .end
+  .end
+.end
+
+# ----------------------------------------------------------------------------
+# Stable "type ids" (hash-like) — no strings
+# ----------------------------------------------------------------------------
+
+type AbiTypeId = AbiU64
+
+# Simple deterministic fnv1a64 for compile-time-ish ids (placeholder)
+fn fnv1a64(seed: AbiU64, bytes: [AbiU8]) -> AbiU64
+  let mut h: AbiU64 = seed
+  let mut i: AbiU64 = 0
+  while i < (bytes.len() as AbiU64)
+    h = h ^ (bytes[i as u32] as AbiU64)
+    h = h * 1099511628211
+    i = i + 1
+  .end
+  ret h
+.end
+
+fn type_id_from_name(name_utf8: [AbiU8]) -> AbiTypeId
+  # seed = FNV offset basis
+  ret fnv1a64(14695981039346656037, name_utf8)
+.end
+
+# ----------------------------------------------------------------------------
+# Type kinds (FFI metadata)
+# ----------------------------------------------------------------------------
+
+enum AbiTypeKind
+  Invalid = 0
+  Scalar = 1
+  Pointer = 2
+  Slice = 3
+  String = 4
+  Handle = 5
+  Struct = 6
+  Enum = 7
+  Union = 8
+  Array = 9
+  Result = 10
+.end
+
+enum AbiScalarKind
+  U8 = 1
+  U16 = 2
+  U32 = 3
+  U64 = 4
+  I32 = 5
+  I64 = 6
+  Bool = 7
+  F32 = 8
+  F64 = 9
+.end
+
+struct AbiTypeDesc
+  id: AbiTypeId
+  kind: AbiTypeKind
+  size: AbiSize
+  align: AbiAlign
+
+  # For scalar
+  scalar: AbiScalarKind
+
+  # For pointer/slice/array
+  elem_id: AbiTypeId
+  elem_count: AbiU64
+
+  # For structs/enums
+  fields_ptr: AbiU64
+  field_count: AbiU32
+
+  # Versioning / stability
+  abi_version: AbiU32
+  flags: AbiU32
+
+  reserved0: AbiU64
+  reserved1: AbiU64
+.end
+
+const ABI_TYPEDESC_FLAG_POD: AbiU32 = 1 << 0
+const ABI_TYPEDESC_FLAG_TRIVIAL_DROP: AbiU32 = 1 << 1
+const ABI_TYPEDESC_FLAG_FFI_SAFE: AbiU32 = 1 << 2
+const ABI_TYPEDESC_FLAG_STABLE_LAYOUT: AbiU32 = 1 << 3
+
+fn desc_scalar(id: AbiTypeId, sk: AbiScalarKind, size: AbiSize, align: AbiAlign) -> AbiTypeDesc
+  ret AbiTypeDesc
+    id: id
+    kind: AbiTypeKind.Scalar
+    size: size
+    align: align
+    scalar: sk
+    elem_id: 0
+    elem_count: 0
+    fields_ptr: 0
+    field_count: 0
+    abi_version: 1
+    flags: ABI_TYPEDESC_FLAG_POD | ABI_TYPEDESC_FLAG_FFI_SAFE | ABI_TYPEDESC_FLAG_STABLE_LAYOUT
+    reserved0: 0
+    reserved1: 0
+  .end
+.end
+
+fn desc_struct(id: AbiTypeId, size: AbiSize, align: AbiAlign, field_count: AbiU32, fields_ptr: AbiU64) -> AbiTypeDesc
+  ret AbiTypeDesc
+    id: id
+    kind: AbiTypeKind.Struct
+    size: size
+    align: align
+    scalar: AbiScalarKind.U8
+    elem_id: 0
+    elem_count: 0
+    fields_ptr: fields_ptr
+    field_count: field_count
+    abi_version: 1
+    flags: ABI_TYPEDESC_FLAG_POD | ABI_TYPEDESC_FLAG_FFI_SAFE | ABI_TYPEDESC_FLAG_STABLE_LAYOUT
+    reserved0: 0
+    reserved1: 0
+  .end
+.end
+
+# ----------------------------------------------------------------------------
+# Canonical ABI layouts for common primitives (assume ptr64 default)
+# ----------------------------------------------------------------------------
+
+fn layout_u8() -> AbiLayout
+  ret abi_layout(1, 1)
+.end
+
+fn layout_u16() -> AbiLayout
+  ret abi_layout(2, 2)
+.end
+
+fn layout_u32() -> AbiLayout
+  ret abi_layout(4, 4)
+.end
+
+fn layout_u64() -> AbiLayout
+  ret abi_layout(8, 8)
+.end
+
+fn layout_i32() -> AbiLayout
+  ret abi_layout(4, 4)
+.end
+
+fn layout_i64() -> AbiLayout
+  ret abi_layout(8, 8)
+.end
+
+fn layout_bool() -> AbiLayout
+  ret abi_layout(1, 1)
+.end
+
+fn layout_ptr64() -> AbiLayout
+  ret abi_layout(8, 8)
+.end
+
+# slice<T> = { ptr: *T, len: u64 }
+fn layout_slice_ptr_len() -> AbiRecordLayout
+  ret compute_record_layout_4(layout_ptr64(), layout_u64(), abi_layout(0, 1), abi_layout(0, 1))
+.end
+
+# str_view = { ptr: *u8, len: u64 }
+fn layout_str_view() -> AbiRecordLayout
+  ret compute_record_layout_4(layout_ptr64(), layout_u64(), abi_layout(0, 1), abi_layout(0, 1))
+.end
+
+# handle = { raw: u64, kind: u32, flags: u32 }
+fn layout_handle() -> AbiRecordLayout
+  ret compute_record_layout_4(layout_u64(), layout_u32(), layout_u32(), abi_layout(0, 1))
+.end
+
+# ----------------------------------------------------------------------------
+# ABI “contract” header: runtime reports its ABI pack
+# ----------------------------------------------------------------------------
+
+struct AbiPackHeader
+  abi_version: AbiU32
+  struct_size: AbiU32
+
+  target: AbiTarget
+
+  type_table_ptr: AbiU64
+  type_table_count: AbiU32
+  field_table_ptr: AbiU64
+  field_table_count: AbiU32
+
+  reserved0: AbiU64
+  reserved1: AbiU64
+.end
+
+fn abi_pack_header_default() -> AbiPackHeader
+  ret AbiPackHeader
+    abi_version: 1
+    struct_size: 0
+    target: abi_target_default()
+    type_table_ptr: 0
+    type_table_count: 0
+    field_table_ptr: 0
+    field_table_count: 0
+    reserved0: 0
+    reserved1: 0
+  .end
+.end
+
+# ----------------------------------------------------------------------------
+# Compatibility check
+# ----------------------------------------------------------------------------
+# Returns ABI_OK if compatible, else ABI_EOPNOTSUPP with error info
+#
+# Policy:
+#   - abi_version must match major
+#   - ptr_width & endian must match
+#   - os/arch may differ for pure plugins depending on kind (policy external)
+# ----------------------------------------------------------------------------
+
+struct AbiCompatReport
+  ok: AbiBool
+  status: AbiStatus
+  error: abie.AbiError
+  expected_abi: AbiU32
+  got_abi: AbiU32
+  reserved0: AbiU64
+.end
+
+fn abi_compat_ok() -> AbiCompatReport
+  ret AbiCompatReport
+    ok: true
+    status: ABI_OK
+    error: abie.abi_error_ok()
+    expected_abi: 1
+    got_abi: 1
+    reserved0: 0
+  .end
+.end
+
+fn abi_check_compat(expected: AbiPackHeader, got: AbiPackHeader) -> AbiCompatReport
+  if expected.abi_version != got.abi_version
+    let e = abie.abi_error_incompat(abie.AbiErrorDomain.Plugin, expected.abi_version, got.abi_version, abie.MSG_PLUGIN_INCOMPAT)
+    ret AbiCompatReport
+      ok: false
+      status: ABI_EOPNOTSUPP
+      error: e
+      expected_abi: expected.abi_version
+      got_abi: got.abi_version
+      reserved0: 0
+    .end
+  .end
+
+  if expected.target.ptr_width != got.target.ptr_width
+    let e = abie.abi_error_incompat(abie.AbiErrorDomain.Plugin, expected.target.ptr_width as AbiU32, got.target.ptr_width as AbiU32, abie.MSG_PLUGIN_INCOMPAT)
+    ret AbiCompatReport
+      ok: false
+      status: ABI_EOPNOTSUPP
+      error: e
+      expected_abi: expected.abi_version
+      got_abi: got.abi_version
+      reserved0: 0
+    .end
+  .end
+
+  if expected.target.endian != got.target.endian
+    let e = abie.abi_error_incompat(abie.AbiErrorDomain.Plugin, expected.target.endian as AbiU32, got.target.endian as AbiU32, abie.MSG_PLUGIN_INCOMPAT)
+    ret AbiCompatReport
+      ok: false
+      status: ABI_EOPNOTSUPP
+      error: e
+      expected_abi: expected.abi_version
+      got_abi: got.abi_version
+      reserved0: 0
+    .end
+  .end
+
+  ret abi_compat_ok()
+.end
+
+# ----------------------------------------------------------------------------
+# Known type ids (canonical names)
+# ----------------------------------------------------------------------------
+# Names are given as bytes (utf8) to generate stable ids.
+# In practice you can hardcode ids post-freeze.
+
+fn tid_u8() -> AbiTypeId
+  ret type_id_from_name([ 'u' as AbiU8, '8' as AbiU8 ])
+.end
+
+fn tid_u64() -> AbiTypeId
+  ret type_id_from_name([ 'u' as AbiU8, '6' as AbiU8, '4' as AbiU8 ])
+.end
+
+fn tid_str_view() -> AbiTypeId
+  ret type_id_from_name([ 's' as AbiU8, 't' as AbiU8, 'r' as AbiU8, '_' as AbiU8, 'v' as AbiU8, 'i' as AbiU8, 'e' as AbiU8, 'w' as AbiU8 ])
+.end
+
+fn tid_slice_u8() -> AbiTypeId
+  ret type_id_from_name([ 's' as AbiU8, 'l' as AbiU8, 'i' as AbiU8, 'c' as AbiU8, 'e' as AbiU8, '_' as AbiU8, 'u' as AbiU8, '8' as AbiU8 ])
+.end
+
+fn tid_handle() -> AbiTypeId
+  ret type_id_from_name([ 'h' as AbiU8, 'a' as AbiU8, 'n' as AbiU8, 'd' as AbiU8, 'l' as AbiU8, 'e' as AbiU8 ])
+.end
+
+# ----------------------------------------------------------------------------
+# Build a minimal canonical type table (static descriptors)
+# ----------------------------------------------------------------------------
+
+struct AbiTypeTable
+  count: AbiU32
+  # Keep a small embedded table; larger tables live elsewhere.
+  t0: AbiTypeDesc
+  t1: AbiTypeDesc
+  t2: AbiTypeDesc
+  t3: AbiTypeDesc
+.end
+
+fn abi_type_table_min() -> AbiTypeTable
+  let u8d = desc_scalar(tid_u8(), AbiScalarKind.U8, 1, 1)
+  let u64d = desc_scalar(tid_u64(), AbiScalarKind.U64, 8, 8)
+
+  let strl = layout_str_view()
+  let strd = desc_struct(tid_str_view(), strl.size, strl.align, 2, 0)
+
+  let hdl = layout_handle()
+  let hdd = desc_struct(tid_handle(), hdl.size, hdl.align, 3, 0)
+
+  ret AbiTypeTable
+    count: 4
+    t0: u8d
+    t1: u64d
+    t2: strd
+    t3: hdd
+  .end
+.end
+
+.end

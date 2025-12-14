@@ -1,0 +1,630 @@
+module ray.runtime.bench.b_executor
+
+import runtime.core.rt_result as rtres
+import runtime.core.rt_error as rterr
+import runtime.core.rt_logging as rtlog
+import runtime.core.rt_metrics as rtmet
+import runtime.time.time_instant as tinst
+import runtime.time.time_duration as tdur
+import runtime.executor.exec_runtime as exec
+import runtime.executor.exec_builder as execb
+import runtime.executor.exec_spawn as spawn
+import runtime.task.task_join as join
+import runtime.sync.sync_mpsc as mpsc
+import runtime.sync.sync_notify as notify
+import runtime.async.yield_now as yn
+
+# ============================================================================
+# ray-runtime/bench/b_executor.vitte — Executor benchmark suite (Tokio-like)
+#
+# Objectifs:
+#   - Mesurer le coût de base de l’executor:
+#       * spawn/join (throughput)
+#       * ping-pong (latency)
+#       * fanout/fanin (scheduling pressure)
+#       * mpsc throughput (coordination)
+#       * yield fairness (coop scheduling)
+#       * blocking bridge (si présent)
+#   - Exposer une API de bench "harness" simple, reproductible, configurable.
+#
+# Conventions:
+#   - Mesures en ns/iter, iters/s, p50/p95 (approx) quand possible.
+#   - Warmup + run principal.
+#   - Aucun `{}`. Blocs délimités par `.end`.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Types: config / results / stats
+# ----------------------------------------------------------------------------
+
+type BenchId = u32
+
+struct BenchConfig
+  name: str
+  warmup_iters: u64
+  iters: u64
+  tasks: u32
+  batch: u32
+  payload: u32
+  affinity: str         # "auto" | "pin" | "spread" (indicatif)
+  workers: u32
+  blocking_threads: u32
+  verbose: bool
+  json: bool
+.end
+
+struct BenchStats
+  iters: u64
+  elapsed_ns: u64
+  ns_per_iter: u64
+  iters_per_sec: u64
+  # Approximations simples (optionnelles)
+  min_ns: u64
+  max_ns: u64
+  p50_ns: u64
+  p95_ns: u64
+.end
+
+struct BenchCase
+  id: BenchId
+  name: str
+  desc: str
+.end
+
+struct BenchReport
+  case: BenchCase
+  cfg: BenchConfig
+  stats: BenchStats
+.end
+
+enum BenchError
+  InvalidArgs
+  RuntimeInitFailed
+  BenchFailed
+.end
+
+# ----------------------------------------------------------------------------
+# Low-level utils: timer / math / quantiles approx
+# ----------------------------------------------------------------------------
+
+fn u64_max(a: u64, b: u64) -> u64
+  if a > b
+    ret a
+  else
+    ret b
+  .end
+.end
+
+fn u64_min(a: u64, b: u64) -> u64
+  if a < b
+    ret a
+  else
+    ret b
+  .end
+.end
+
+fn clamp_u64(x: u64, lo: u64, hi: u64) -> u64
+  if x < lo
+    ret lo
+  .end
+  if x > hi
+    ret hi
+  .end
+  ret x
+.end
+
+fn div_round_u64(n: u64, d: u64) -> u64
+  if d == 0
+    ret 0
+  .end
+  ret (n + (d / 2)) / d
+.end
+
+fn iters_per_sec(iters: u64, elapsed_ns: u64) -> u64
+  if elapsed_ns == 0
+    ret 0
+  .end
+  # iters * 1e9 / elapsed_ns
+  ret (iters * 1_000_000_000) / elapsed_ns
+.end
+
+fn ns_per_iter(iters: u64, elapsed_ns: u64) -> u64
+  if iters == 0
+    ret 0
+  .end
+  ret elapsed_ns / iters
+.end
+
+# Snapshot times in ns using runtime.time.*
+fn now_ns() -> u64
+  # Hypothèse: time_instant expose now() + elapsed_ns()
+  let t = tinst.now()
+  ret tinst.to_unix_nanos(t)
+.end
+
+# ----------------------------------------------------------------------------
+# Harness: run warmup + measure
+# ----------------------------------------------------------------------------
+
+type BenchFn = fn(cfg: BenchConfig, rt: exec.Runtime) -> rtres.Result[BenchStats, BenchError]
+
+fn run_case(case: BenchCase, cfg: BenchConfig, f: BenchFn) -> rtres.Result[BenchReport, BenchError]
+  # Init runtime (executor)
+  let mut b = execb.builder()
+  execb.set_workers(b, cfg.workers)
+  execb.set_blocking_threads(b, cfg.blocking_threads)
+  execb.set_name(b, "ray-runtime-bench")
+  let rt_res = execb.build(b)
+
+  if rtres.is_err(rt_res)
+    ret rtres.err(BenchError.RuntimeInitFailed)
+  .end
+
+  let rt = rtres.unwrap(rt_res)
+
+  if cfg.verbose
+    rtlog.info("bench", cfg.name)
+  .end
+
+  # Warmup
+  if cfg.warmup_iters > 0
+    let mut warm_cfg = cfg
+    warm_cfg.iters = cfg.warmup_iters
+    warm_cfg.warmup_iters = 0
+    let wres = f(warm_cfg, rt)
+    if rtres.is_err(wres)
+      ret rtres.err(BenchError.BenchFailed)
+    .end
+  .end
+
+  # Measure
+  let sres = f(cfg, rt)
+  if rtres.is_err(sres)
+    ret rtres.err(BenchError.BenchFailed)
+  .end
+
+  let stats = rtres.unwrap(sres)
+
+  let rep = BenchReport
+    case: case
+    cfg: cfg
+    stats: stats
+  .end
+
+  ret rtres.ok(rep)
+.end
+
+# ----------------------------------------------------------------------------
+# Bench 1: spawn + join throughput
+# ----------------------------------------------------------------------------
+# Pattern:
+#   - Spawn cfg.tasks tasks; each task increments local counter cfg.batch times
+#   - Join all
+#   - Repeat until iters reached (iters = total tasks waves)
+#
+# Mesure:
+#   - iters = cfg.iters waves
+#   - ns/iter = elapsed / (iters * tasks)  (coût moyen par task spawn+join)
+# ----------------------------------------------------------------------------
+
+fn bench_spawn_join(cfg: BenchConfig, rt: exec.Runtime) -> rtres.Result[BenchStats, BenchError]
+  let mut total_tasks: u64 = 0
+  let mut min_ns: u64 = 0
+  let mut max_ns: u64 = 0
+
+  let start = now_ns()
+
+  let mut wave: u64 = 0
+  while wave < cfg.iters
+    let wave_t0 = now_ns()
+
+    let mut joins = join.JoinSet.new()
+
+    let mut i: u32 = 0
+    while i < cfg.tasks
+      # Task body: simple loop (avoid optimizing away by returning counter)
+      let batch = cfg.batch
+      let h = spawn.spawn(rt, fn() -> u64
+        let mut acc: u64 = 0
+        let mut k: u32 = 0
+        while k < batch
+          acc = acc + 1
+          k = k + 1
+        .end
+        ret acc
+      .end)
+
+      join.push(joins, h)
+      i = i + 1
+    .end
+
+    # Join all
+    let mut joined: u32 = 0
+    while joined < cfg.tasks
+      let r = join.next(joins)
+      if join.is_none(r)
+        # should not happen; indicates scheduler starvation or bug
+        ret rtres.err(BenchError.BenchFailed)
+      .end
+      joined = joined + 1
+    .end
+
+    total_tasks = total_tasks + cfg.tasks as u64
+
+    let wave_t1 = now_ns()
+    let wave_ns = wave_t1 - wave_t0
+    if wave == 0
+      min_ns = wave_ns
+      max_ns = wave_ns
+    else
+      min_ns = u64_min(min_ns, wave_ns)
+      max_ns = u64_max(max_ns, wave_ns)
+    .end
+
+    wave = wave + 1
+  .end
+
+  let end = now_ns()
+  let elapsed = end - start
+
+  # ns per task (spawn+join): elapsed / total_tasks
+  let npi = if total_tasks == 0 then 0 else elapsed / total_tasks .end
+  let ips = iters_per_sec(total_tasks, elapsed)
+
+  let stats = BenchStats
+    iters: total_tasks
+    elapsed_ns: elapsed
+    ns_per_iter: npi
+    iters_per_sec: ips
+    min_ns: min_ns
+    max_ns: max_ns
+    p50_ns: 0
+    p95_ns: 0
+  .end
+
+  ret rtres.ok(stats)
+.end
+
+# ----------------------------------------------------------------------------
+# Bench 2: ping-pong latency (two tasks + notify)
+# ----------------------------------------------------------------------------
+
+fn bench_ping_pong(cfg: BenchConfig, rt: exec.Runtime) -> rtres.Result[BenchStats, BenchError]
+  let n = cfg.iters
+  if n == 0
+    ret rtres.ok(BenchStats
+      iters: 0
+      elapsed_ns: 0
+      ns_per_iter: 0
+      iters_per_sec: 0
+      min_ns: 0
+      max_ns: 0
+      p50_ns: 0
+      p95_ns: 0
+    .end)
+  .end
+
+  let a = notify.Notify.new()
+  let b = notify.Notify.new()
+
+  # Actor B: waits on A then signals B
+  let hb = spawn.spawn(rt, fn() -> u64
+    let mut i: u64 = 0
+    while i < n
+      notify.wait(a)
+      notify.notify_one(b)
+      i = i + 1
+    .end
+    ret i
+  .end)
+
+  # Actor A: signals A then waits on B
+  let start = now_ns()
+  let mut i: u64 = 0
+  while i < n
+    notify.notify_one(a)
+    notify.wait(b)
+    i = i + 1
+  .end
+  let end = now_ns()
+
+  let _ = join.block_on(rt, hb)
+
+  let elapsed = end - start
+  let npi = ns_per_iter(n, elapsed)
+  let ips = iters_per_sec(n, elapsed)
+
+  let stats = BenchStats
+    iters: n
+    elapsed_ns: elapsed
+    ns_per_iter: npi
+    iters_per_sec: ips
+    min_ns: 0
+    max_ns: 0
+    p50_ns: 0
+    p95_ns: 0
+  .end
+
+  ret rtres.ok(stats)
+.end
+
+# ----------------------------------------------------------------------------
+# Bench 3: fanout/fanin (scheduling pressure)
+# ----------------------------------------------------------------------------
+#   - 1 coordinator spawns cfg.tasks workers
+#   - each worker does a small loop, then sends 1 msg to channel
+#   - coordinator receives cfg.tasks msgs
+# ----------------------------------------------------------------------------
+
+fn bench_fanout_fanin(cfg: BenchConfig, rt: exec.Runtime) -> rtres.Result[BenchStats, BenchError]
+  let mut total_msgs: u64 = 0
+
+  let start = now_ns()
+
+  let mut w: u64 = 0
+  while w < cfg.iters
+    let (tx, rx) = mpsc.channel(cfg.tasks)
+
+    let mut i: u32 = 0
+    while i < cfg.tasks
+      let txi = mpsc.clone_sender(tx)
+      let batch = cfg.batch
+      let _h = spawn.spawn(rt, fn() -> u64
+        let mut acc: u64 = 0
+        let mut k: u32 = 0
+        while k < batch
+          acc = acc + 1
+          k = k + 1
+        .end
+        mpsc.send(txi, acc)
+        ret acc
+      .end)
+      i = i + 1
+    .end
+
+    # fanin
+    let mut got: u32 = 0
+    while got < cfg.tasks
+      let v = mpsc.recv(rx)
+      if mpsc.is_none(v)
+        ret rtres.err(BenchError.BenchFailed)
+      .end
+      got = got + 1
+    .end
+
+    total_msgs = total_msgs + cfg.tasks as u64
+    w = w + 1
+  .end
+
+  let end = now_ns()
+  let elapsed = end - start
+  let npi = ns_per_iter(total_msgs, elapsed)
+  let ips = iters_per_sec(total_msgs, elapsed)
+
+  ret rtres.ok(BenchStats
+    iters: total_msgs
+    elapsed_ns: elapsed
+    ns_per_iter: npi
+    iters_per_sec: ips
+    min_ns: 0
+    max_ns: 0
+    p50_ns: 0
+    p95_ns: 0
+  .end)
+.end
+
+# ----------------------------------------------------------------------------
+# Bench 4: yield fairness / coop scheduling
+# ----------------------------------------------------------------------------
+#   - spawn cfg.tasks loops: (work batch) + yield_now
+#   - run for cfg.iters "ticks" (per task) => total iters = cfg.iters * tasks
+# ----------------------------------------------------------------------------
+
+fn bench_yield(cfg: BenchConfig, rt: exec.Runtime) -> rtres.Result[BenchStats, BenchError]
+  if cfg.tasks == 0
+    ret rtres.ok(BenchStats
+      iters: 0
+      elapsed_ns: 0
+      ns_per_iter: 0
+      iters_per_sec: 0
+      min_ns: 0
+      max_ns: 0
+      p50_ns: 0
+      p95_ns: 0
+    .end)
+  .end
+
+  let it = cfg.iters
+  let total = (it * (cfg.tasks as u64))
+
+  let (tx, rx) = mpsc.channel(cfg.tasks)
+
+  let start = now_ns()
+
+  let mut i: u32 = 0
+  while i < cfg.tasks
+    let txi = mpsc.clone_sender(tx)
+    let batch = cfg.batch
+    let _h = spawn.spawn(rt, fn() -> u64
+      let mut t: u64 = 0
+      while t < it
+        # small CPU work
+        let mut k: u32 = 0
+        let mut acc: u64 = 0
+        while k < batch
+          acc = acc + 1
+          k = k + 1
+        .end
+        yn.yield_now()
+        t = t + 1
+      .end
+      mpsc.send(txi, 1u64)
+      ret 0
+    .end)
+    i = i + 1
+  .end
+
+  # wait all workers done
+  let mut done: u32 = 0
+  while done < cfg.tasks
+    let v = mpsc.recv(rx)
+    if mpsc.is_none(v)
+      ret rtres.err(BenchError.BenchFailed)
+    .end
+    done = done + 1
+  .end
+
+  let end = now_ns()
+  let elapsed = end - start
+
+  ret rtres.ok(BenchStats
+    iters: total
+    elapsed_ns: elapsed
+    ns_per_iter: ns_per_iter(total, elapsed)
+    iters_per_sec: iters_per_sec(total, elapsed)
+    min_ns: 0
+    max_ns: 0
+    p50_ns: 0
+    p95_ns: 0
+  .end)
+.end
+
+# ----------------------------------------------------------------------------
+# Registry of benches
+# ----------------------------------------------------------------------------
+
+fn cases() -> [BenchCase]
+  ret [
+    BenchCase id: 1 name: "spawn_join" desc: "Spawn + Join throughput (avg ns per task)" .end,
+    BenchCase id: 2 name: "ping_pong"  desc: "Ping-pong latency via Notify (avg ns per round)" .end,
+    BenchCase id: 3 name: "fanout"     desc: "Fanout/Fanin scheduling pressure via MPSC" .end,
+    BenchCase id: 4 name: "yield"      desc: "Coop yield fairness (work+yield loops)" .end
+  ]
+.end
+
+fn dispatch(id: BenchId) -> BenchFn
+  if id == 1
+    ret bench_spawn_join
+  .end
+  if id == 2
+    ret bench_ping_pong
+  .end
+  if id == 3
+    ret bench_fanout_fanin
+  .end
+  if id == 4
+    ret bench_yield
+  .end
+  ret bench_spawn_join
+.end
+
+# ----------------------------------------------------------------------------
+# Output helpers (text + json modes)
+# ----------------------------------------------------------------------------
+
+fn print_report(rep: BenchReport)
+  # Placeholder: branch on cfg.json; print minimal stable format
+  if rep.cfg.json
+    rtlog.info("bench.json", "TODO: emit structured json")
+    ret
+  .end
+
+  rtlog.info("bench.case", rep.case.name)
+  rtlog.info("bench.iters", rtlog.fmt_u64(rep.stats.iters))
+  rtlog.info("bench.elapsed_ns", rtlog.fmt_u64(rep.stats.elapsed_ns))
+  rtlog.info("bench.ns_per_iter", rtlog.fmt_u64(rep.stats.ns_per_iter))
+  rtlog.info("bench.iters_per_sec", rtlog.fmt_u64(rep.stats.iters_per_sec))
+.end
+
+# ----------------------------------------------------------------------------
+# Entrypoint (tool-style)
+# ----------------------------------------------------------------------------
+# Arguments attendus (convention):
+#   --case <name|id>     default: spawn_join
+#   --iters N            default: 1000
+#   --warmup N           default: 200
+#   --tasks N            default: 1000
+#   --batch N            default: 32
+#   --workers N          default: auto (>=1)
+#   --blocking N         default: 0/auto
+#   --json               default: false
+#   --verbose            default: false
+#
+# Note: parsing args dépend de ton CLI; ici c’est volontairement minimal/placeholder.
+# ----------------------------------------------------------------------------
+
+fn default_cfg() -> BenchConfig
+  ret BenchConfig
+    name: "spawn_join"
+    warmup_iters: 200
+    iters: 1000
+    tasks: 1000
+    batch: 32
+    payload: 0
+    affinity: "auto"
+    workers: 0
+    blocking_threads: 0
+    verbose: false
+    json: false
+  .end
+.end
+
+fn resolve_case_id(name_or_id: str) -> BenchId
+  # Minimal mapping
+  if name_or_id == "spawn_join"
+    ret 1
+  .end
+  if name_or_id == "ping_pong"
+    ret 2
+  .end
+  if name_or_id == "fanout"
+    ret 3
+  .end
+  if name_or_id == "yield"
+    ret 4
+  .end
+  # try parse integer
+  let n = rtlog.parse_u32(name_or_id)
+  ret n as BenchId
+.end
+
+fn main(args: [str]) -> i32
+  let cfg = default_cfg()
+
+  # TODO: parse args -> cfg
+  # - set cfg.name/case
+  # - set iters/warmup/tasks/batch/workers/json/verbose
+
+  # Auto workers fallback
+  if cfg.workers == 0
+    # placeholder: use platform cpu count if exposed
+    cfg.workers = 4
+  .end
+
+  let cid = resolve_case_id(cfg.name)
+  let mut selected: BenchCase = BenchCase id: cid name: cfg.name desc: "" .end
+
+  let all = cases()
+  let mut idx: u32 = 0
+  while idx < (all.len() as u32)
+    if all[idx].id == cid
+      selected = all[idx]
+      break
+    .end
+    idx = idx + 1
+  .end
+
+  let f = dispatch(cid)
+  let res = run_case(selected, cfg, f)
+
+  if rtres.is_err(res)
+    rtlog.error("bench.fail", "execution failed")
+    ret 1
+  .end
+
+  let rep = rtres.unwrap(res)
+  print_report(rep)
+  ret 0
+.end
+
+.end

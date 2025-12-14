@@ -1,0 +1,315 @@
+module ray.runtime.abi.abi_strings
+
+import ray.runtime.abi.abi_errors as abie
+import ray.runtime.abi.abi_result as abir
+import ray.runtime.abi.abi_slices as abis
+
+# ============================================================================
+# ray-runtime/src/abi/abi_strings.vitte — ABI string conventions (MAX, no alloc)
+#
+# Objectifs:
+#   - Formaliser les conventions strings du runtime ABI:
+#       * utf8 str_view (ptr+len) (non NUL-terminated)
+#       * cstr_view (ptr NUL-terminated) (optionnel, interop C)
+#       * owned string buffer via caller-owned (mut_slice_u8) + out_len
+#   - Helpers purs:
+#       * validations
+#       * comparisons (sans accès mémoire direct => version "metadata" + hooks)
+#       * hashing stable (FNV1a) sur bytes fournis (quand bytes accessibles)
+#       * packing/unpacking ids (file_id/name_id)
+#
+# Contraintes:
+#   - Pas d'I/O
+#   - Pas d'alloc implicite
+#   - Compat ABI: ajout en fin uniquement
+#   - Aucun `{}` ; blocs `.end`
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Aliases
+# ----------------------------------------------------------------------------
+
+type AbiStatus = abie.AbiStatus
+type AbiU8  = u8
+type AbiU32 = u32
+type AbiU64 = u64
+type AbiBool = bool
+
+type AbiPtr = abis.AbiPtr
+
+const ABI_OK: AbiStatus = abie.ABI_OK
+
+# ----------------------------------------------------------------------------
+# String types (re-export)
+# ----------------------------------------------------------------------------
+
+type AbiStrView = abis.AbiStrView
+type AbiCStrView = abis.AbiCStrView
+type AbiSliceU8 = abis.AbiSliceU8
+type AbiMutSliceU8 = abis.AbiMutSliceU8
+
+# ----------------------------------------------------------------------------
+# Msg ids
+# ----------------------------------------------------------------------------
+
+const MSG_UTF8_INVALID: AbiU32 = abie.msg_id(abie.AbiErrorDomain.Parse, abie.AbiErrorClass.ParseError, 1)
+const MSG_STR_OVERFLOW: AbiU32 = abie.msg_id(abie.AbiErrorDomain.Runtime, abie.AbiErrorClass.Overflow, 2)
+const MSG_BUF_TOO_SMALL: AbiU32 = abie.msg_id(abie.AbiErrorDomain.Runtime, abie.AbiErrorClass.Overflow, 3)
+const MSG_STR_NULL: AbiU32 = abie.msg_id(abie.AbiErrorDomain.Runtime, abie.AbiErrorClass.InvalidArgument, 4)
+
+# ----------------------------------------------------------------------------
+# Validation
+# ----------------------------------------------------------------------------
+
+fn validate_view(v: AbiStrView) -> AbiStatus
+  ret abis.validate_str(v)
+.end
+
+fn validate_view_r(v: AbiStrView, domain: abie.AbiErrorDomain, msg: AbiU32) -> abir.AbiResult
+  let st = validate_view(v)
+  if st == ABI_OK
+    ret abir.ok()
+  .end
+  ret abir.err(abie.abi_error_from_status(st, domain, msg))
+.end
+
+fn validate_cstr(v: AbiCStrView) -> AbiStatus
+  if v.ptr == 0
+    ret abie.ABI_EINVAL
+  .end
+  ret ABI_OK
+.end
+
+# ----------------------------------------------------------------------------
+# Copy-out convention: write a str_view into caller buffer (utf8) + out_len
+# ----------------------------------------------------------------------------
+# Semantics:
+#   - If buf.len == 0: returns required length in out_len, status=OK
+#   - If buf.len < required: status=ERANGE, out_len=required
+#   - On success: writes bytes, out_len=written
+#   - No NUL terminator added (caller can add if needed)
+#
+# Note:
+#   - Actual memcpy done by platform layer; here we define helper contracts.
+#   - "read bytes from v.ptr" is not possible in pure layer, so we model it as
+#     an operation request to be executed by platform/mem implementation.
+
+enum AbiStrCopyMode
+  Exact = 0        # copy exactly v.len
+  WithNul = 1      # copy v.len + '\0' (for C interop)
+.end
+
+struct AbiStrCopyReq
+  mode: AbiStrCopyMode
+  src: AbiStrView
+  dst: AbiMutSliceU8
+  out_len_ptr: AbiPtr        # *u64 in ABI
+  reserved0: AbiU64
+.end
+
+struct AbiStrCopyRes
+  status: AbiStatus
+  error: abie.AbiError
+  required: AbiU64
+  written: AbiU64
+.end
+
+fn str_copy_req(mode: AbiStrCopyMode, src: AbiStrView, dst: AbiMutSliceU8, out_len_ptr: AbiPtr) -> AbiStrCopyReq
+  ret AbiStrCopyReq
+    mode: mode
+    src: src
+    dst: dst
+    out_len_ptr: out_len_ptr
+    reserved0: 0
+  .end
+.end
+
+fn str_copy_res_ok(written: AbiU64, required: AbiU64) -> AbiStrCopyRes
+  ret AbiStrCopyRes
+    status: ABI_OK
+    error: abie.abi_error_ok()
+    required: required
+    written: written
+  .end
+.end
+
+fn str_copy_res_err(domain: abie.AbiErrorDomain, msg: AbiU32, st: AbiStatus, required: AbiU64) -> AbiStrCopyRes
+  let e = abie.abi_error_from_status(st, domain, msg)
+  ret AbiStrCopyRes status: st error: e required: required written: 0 .end
+.end
+
+fn str_required_len(v: AbiStrView, mode: AbiStrCopyMode) -> AbiU64
+  if mode == AbiStrCopyMode.WithNul
+    ret v.len + 1
+  .end
+  ret v.len
+.end
+
+# ----------------------------------------------------------------------------
+# Comparisons / ordering (requires byte access)
+# ----------------------------------------------------------------------------
+# Pure layer cannot dereference ptr; we define "hooks" API shapes:
+#   - a platform function compares two byte ranges and returns ordering.
+# The runtime/platform can implement it with memcmp.
+#
+# We keep the ABI records here.
+
+enum AbiOrdering
+  Less = -1
+  Equal = 0
+  Greater = 1
+.end
+
+struct AbiStrCmpReq
+  a: AbiStrView
+  b: AbiStrView
+  reserved0: AbiU64
+.end
+
+struct AbiStrCmpRes
+  status: AbiStatus
+  error: abie.AbiError
+  ord: AbiI32
+.end
+
+fn cmp_req(a: AbiStrView, b: AbiStrView) -> AbiStrCmpReq
+  ret AbiStrCmpReq a: a b: b reserved0: 0 .end
+.end
+
+fn cmp_res_ok(ord: AbiI32) -> AbiStrCmpRes
+  ret AbiStrCmpRes status: ABI_OK error: abie.abi_error_ok() ord: ord .end
+.end
+
+fn cmp_res_err(domain: abie.AbiErrorDomain, msg: AbiU32, st: AbiStatus) -> AbiStrCmpRes
+  let e = abie.abi_error_from_status(st, domain, msg)
+  ret AbiStrCmpRes status: st error: e ord: 0 .end
+.end
+
+# ----------------------------------------------------------------------------
+# Hashing (FNV1a64) — for bytes known in-process
+# ----------------------------------------------------------------------------
+# If caller has bytes array (e.g. already copied), we can hash here.
+# Otherwise platform provides "hash range" primitive.
+
+const FNV1A64_OFFSET: AbiU64 = 14695981039346656037
+const FNV1A64_PRIME: AbiU64  = 1099511628211
+
+fn fnv1a64_bytes(seed: AbiU64, bytes: [AbiU8]) -> AbiU64
+  let mut h: AbiU64 = seed
+  let mut i: AbiU64 = 0
+  while i < (bytes.len() as AbiU64)
+    h = h ^ (bytes[i as u32] as AbiU64)
+    h = h * FNV1A64_PRIME
+    i = i + 1
+  .end
+  ret h
+.end
+
+fn hash_utf8(bytes: [AbiU8]) -> AbiU64
+  ret fnv1a64_bytes(FNV1A64_OFFSET, bytes)
+.end
+
+# ----------------------------------------------------------------------------
+# Name/file ids packing (stable)
+# ----------------------------------------------------------------------------
+# For tooling: derive 32-bit ids from 64-bit hashes.
+# Collisions acceptable in diagnostics; not for security.
+
+fn id32_from_hash64(h: AbiU64) -> AbiU32
+  let lo = (h & 0xFFFFFFFF) as AbiU32
+  let hi = ((h >> 32) & 0xFFFFFFFF) as AbiU32
+  ret lo ^ hi
+.end
+
+fn name_id_from_utf8(bytes: [AbiU8]) -> AbiU32
+  let h = hash_utf8(bytes)
+  ret id32_from_hash64(h)
+.end
+
+# ----------------------------------------------------------------------------
+# UTF-8 validation (minimal)
+# ----------------------------------------------------------------------------
+# Full UTF-8 validation requires scanning bytes; we support a minimal checker
+# when bytes are available. For pointer views, validation should be done by
+# platform/higher layer after copy.
+#
+# This function is strict and returns bool.
+
+fn utf8_is_valid(bytes: [AbiU8]) -> AbiBool
+  let mut i: AbiU64 = 0
+  while i < (bytes.len() as AbiU64)
+    let b0 = bytes[i as u32]
+    if b0 < 0x80
+      i = i + 1
+      continue
+    .end
+
+    # 2-byte
+    if (b0 & 0xE0) == 0xC0
+      if i + 1 >= (bytes.len() as AbiU64)
+        ret false
+      .end
+      let b1 = bytes[(i + 1) as u32]
+      if (b1 & 0xC0) != 0x80
+        ret false
+      .end
+      # overlong check
+      if b0 < 0xC2
+        ret false
+      .end
+      i = i + 2
+      continue
+    .end
+
+    # 3-byte
+    if (b0 & 0xF0) == 0xE0
+      if i + 2 >= (bytes.len() as AbiU64)
+        ret false
+      .end
+      let b1 = bytes[(i + 1) as u32]
+      let b2 = bytes[(i + 2) as u32]
+      if ((b1 & 0xC0) != 0x80) or ((b2 & 0xC0) != 0x80)
+        ret false
+      .end
+      # overlong + surrogate checks
+      if b0 == 0xE0 and b1 < 0xA0
+        ret false
+      .end
+      if b0 == 0xED and b1 >= 0xA0
+        ret false
+      .end
+      i = i + 3
+      continue
+    .end
+
+    # 4-byte
+    if (b0 & 0xF8) == 0xF0
+      if i + 3 >= (bytes.len() as AbiU64)
+        ret false
+      .end
+      let b1 = bytes[(i + 1) as u32]
+      let b2 = bytes[(i + 2) as u32]
+      let b3 = bytes[(i + 3) as u32]
+      if ((b1 & 0xC0) != 0x80) or ((b2 & 0xC0) != 0x80) or ((b3 & 0xC0) != 0x80)
+        ret false
+      .end
+      # limits (U+10FFFF)
+      if b0 == 0xF0 and b1 < 0x90
+        ret false
+      .end
+      if b0 > 0xF4
+        ret false
+      .end
+      if b0 == 0xF4 and b1 > 0x8F
+        ret false
+      .end
+      i = i + 4
+      continue
+    .end
+
+    ret false
+  .end
+  ret true
+.end
+
+.end

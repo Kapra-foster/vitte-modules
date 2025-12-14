@@ -1,0 +1,448 @@
+module ray.runtime.bench.b_io_copy
+
+import runtime.core.rt_result as rtres
+import runtime.core.rt_logging as rtlog
+import runtime.time.time_instant as tinst
+import runtime.executor.exec_builder as execb
+import runtime.executor.exec_runtime as exec
+import runtime.executor.exec_spawn as spawn
+import runtime.task.task_join as join
+import runtime.sync.sync_mpsc as mpsc
+import runtime.async.yield_now as yn
+
+import runtime.io.io_buf as iobuf
+import runtime.io.io_bytes as iobytes
+import runtime.io.io_copy as iocopy
+import runtime.io.io_util as ioutil
+
+import runtime.fs.fs_temp as fstemp
+
+# ============================================================================
+# ray-runtime/bench/b_io_copy.vitte — IO copy benchmark suite (Tokio-like)
+#
+# Mesure:
+#   - copy memory->memory (Reader/Writer in-memory)
+#   - copy file->file (temp)
+#   - copy file->sink (read only)
+#   - copy source->null (write only)
+#   - copy with chunk sizes (buf sizes)
+#   - async scheduling impact (spawned vs inline)
+#
+# Conventions:
+#   - Warmup + run
+#   - Résultats: bytes/s, ns/MB, ns/op
+#   - Aucun `{}`. Blocs `.end`.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Types: config / results
+# ----------------------------------------------------------------------------
+
+type BenchId = u32
+
+struct CopyBenchConfig
+  name: str
+  warmup_iters: u64
+  iters: u64
+  size_bytes: u64
+  chunk_bytes: u32
+  tasks: u32
+  workers: u32
+  blocking_threads: u32
+  use_files: bool
+  spawned: bool
+  verbose: bool
+  json: bool
+.end
+
+struct CopyBenchStats
+  iters: u64
+  bytes_total: u64
+  elapsed_ns: u64
+  bytes_per_sec: u64
+  ns_per_mb: u64
+  ns_per_iter: u64
+.end
+
+enum CopyBenchError
+  InvalidArgs
+  RuntimeInitFailed
+  IoFailed
+.end
+
+# ----------------------------------------------------------------------------
+# Math/time helpers
+# ----------------------------------------------------------------------------
+
+fn now_ns() -> u64
+  let t = tinst.now()
+  ret tinst.to_unix_nanos(t)
+.end
+
+fn bytes_per_sec(bytes: u64, elapsed_ns: u64) -> u64
+  if elapsed_ns == 0
+    ret 0
+  .end
+  ret (bytes * 1_000_000_000) / elapsed_ns
+.end
+
+fn ns_per_mb(bytes: u64, elapsed_ns: u64) -> u64
+  if bytes == 0
+    ret 0
+  .end
+  let mb: u64 = 1_048_576
+  # elapsed_ns / (bytes/MB)  => elapsed_ns * MB / bytes
+  ret (elapsed_ns * mb) / bytes
+.end
+
+fn ns_per_iter(iters: u64, elapsed_ns: u64) -> u64
+  if iters == 0
+    ret 0
+  .end
+  ret elapsed_ns / iters
+.end
+
+# ----------------------------------------------------------------------------
+# IO fixtures: memory reader/writer + null sink/source
+# ----------------------------------------------------------------------------
+
+struct NullSink
+.end
+
+fn nullsink_new() -> NullSink
+  ret NullSink .end
+.end
+
+fn nullsink_write_all(_s: NullSink, _buf: [u8]) -> u64
+  # pretend write succeeded
+  ret _buf.len() as u64
+.end
+
+struct ZeroSource
+  remaining: u64
+.end
+
+fn zerosrc_new(n: u64) -> ZeroSource
+  ret ZeroSource remaining: n .end
+.end
+
+fn zerosrc_read(_s: ZeroSource, out: [u8]) -> u32
+  if _s.remaining == 0
+    ret 0
+  .end
+  let mut n: u32 = out.len() as u32
+  if (n as u64) > _s.remaining
+    n = _s.remaining as u32
+  .end
+  # fill zeros (placeholder; if std has mem.fill use it)
+  let mut i: u32 = 0
+  while i < n
+    out[i] = 0
+    i = i + 1
+  .end
+  _s.remaining = _s.remaining - (n as u64)
+  ret n
+.end
+
+# ----------------------------------------------------------------------------
+# Runtime init
+# ----------------------------------------------------------------------------
+
+fn build_runtime(cfg: CopyBenchConfig) -> rtres.Result[exec.Runtime, CopyBenchError]
+  let mut b = execb.builder()
+  execb.set_workers(b, cfg.workers)
+  execb.set_blocking_threads(b, cfg.blocking_threads)
+  execb.set_name(b, "ray-io-copy-bench")
+  let r = execb.build(b)
+  if rtres.is_err(r)
+    ret rtres.err(CopyBenchError.RuntimeInitFailed)
+  .end
+  ret rtres.ok(rtres.unwrap(r))
+.end
+
+# ----------------------------------------------------------------------------
+# Bench patterns
+# ----------------------------------------------------------------------------
+
+fn bench_mem_to_mem(cfg: CopyBenchConfig, rt: exec.Runtime) -> rtres.Result[CopyBenchStats, CopyBenchError]
+  # Prepare src buffer
+  let size = cfg.size_bytes
+  let chunk = cfg.chunk_bytes
+  if size == 0 or chunk == 0
+    ret rtres.err(CopyBenchError.InvalidArgs)
+  .end
+
+  let src = iobytes.bytes_repeat(0xABu8, size)   # placeholder API
+  let mut total_bytes: u64 = 0
+
+  let start = now_ns()
+
+  let mut it: u64 = 0
+  while it < cfg.iters
+    # Reader/writer wrappers (placeholder: adapt to your io traits)
+    let r = iobuf.reader_from_bytes(src)
+    let w = iobuf.writer_memory()
+
+    let n = iocopy.copy_buf(r, w, chunk)         # returns bytes copied (u64)
+    total_bytes = total_bytes + n
+
+    it = it + 1
+  .end
+
+  let end = now_ns()
+  let elapsed = end - start
+
+  ret rtres.ok(CopyBenchStats
+    iters: cfg.iters
+    bytes_total: total_bytes
+    elapsed_ns: elapsed
+    bytes_per_sec: bytes_per_sec(total_bytes, elapsed)
+    ns_per_mb: ns_per_mb(total_bytes, elapsed)
+    ns_per_iter: ns_per_iter(cfg.iters, elapsed)
+  .end)
+.end
+
+fn bench_zero_to_null(cfg: CopyBenchConfig, rt: exec.Runtime) -> rtres.Result[CopyBenchStats, CopyBenchError]
+  let size = cfg.size_bytes
+  let chunk = cfg.chunk_bytes
+  if size == 0 or chunk == 0
+    ret rtres.err(CopyBenchError.InvalidArgs)
+  .end
+
+  let start = now_ns()
+  let mut total_bytes: u64 = 0
+
+  let mut it: u64 = 0
+  while it < cfg.iters
+    let mut src = zerosrc_new(size)
+    let sink = nullsink_new()
+
+    # Manual copy loop to isolate copy algorithm
+    let mut buf = iobytes.bytes_alloc(chunk as u64)
+    while true
+      let n = zerosrc_read(src, buf)
+      if n == 0
+        break
+      .end
+      let wrote = nullsink_write_all(sink, buf.slice(0, n))
+      total_bytes = total_bytes + wrote
+    .end
+
+    it = it + 1
+  .end
+
+  let end = now_ns()
+  let elapsed = end - start
+
+  ret rtres.ok(CopyBenchStats
+    iters: cfg.iters
+    bytes_total: total_bytes
+    elapsed_ns: elapsed
+    bytes_per_sec: bytes_per_sec(total_bytes, elapsed)
+    ns_per_mb: ns_per_mb(total_bytes, elapsed)
+    ns_per_iter: ns_per_iter(cfg.iters, elapsed)
+  .end)
+.end
+
+fn bench_file_to_file(cfg: CopyBenchConfig, rt: exec.Runtime) -> rtres.Result[CopyBenchStats, CopyBenchError]
+  if not cfg.use_files
+    ret rtres.err(CopyBenchError.InvalidArgs)
+  .end
+
+  let size = cfg.size_bytes
+  let chunk = cfg.chunk_bytes
+  if size == 0 or chunk == 0
+    ret rtres.err(CopyBenchError.InvalidArgs)
+  .end
+
+  let start = now_ns()
+  let mut total_bytes: u64 = 0
+
+  let mut it: u64 = 0
+  while it < cfg.iters
+    let in_path = fstemp.temp_file_path("io_copy_in")
+    let out_path = fstemp.temp_file_path("io_copy_out")
+
+    # Create input with size bytes (placeholder util)
+    fstemp.write_random(in_path, size)
+
+    let r = ioutil.open_read(in_path)
+    let w = ioutil.open_write_trunc(out_path)
+
+    let n = iocopy.copy_buf(r, w, chunk)
+    total_bytes = total_bytes + n
+
+    ioutil.close(r)
+    ioutil.close(w)
+    fstemp.remove(in_path)
+    fstemp.remove(out_path)
+
+    it = it + 1
+  .end
+
+  let end = now_ns()
+  let elapsed = end - start
+
+  ret rtres.ok(CopyBenchStats
+    iters: cfg.iters
+    bytes_total: total_bytes
+    elapsed_ns: elapsed
+    bytes_per_sec: bytes_per_sec(total_bytes, elapsed)
+    ns_per_mb: ns_per_mb(total_bytes, elapsed)
+    ns_per_iter: ns_per_iter(cfg.iters, elapsed)
+  .end)
+.end
+
+# ----------------------------------------------------------------------------
+# Spawned variants (measure scheduler overhead)
+# ----------------------------------------------------------------------------
+
+fn bench_spawned_many(cfg: CopyBenchConfig, rt: exec.Runtime) -> rtres.Result[CopyBenchStats, CopyBenchError]
+  if cfg.tasks == 0
+    ret rtres.err(CopyBenchError.InvalidArgs)
+  .end
+
+  let (tx, rx) = mpsc.channel(cfg.tasks)
+  let size = cfg.size_bytes
+  let chunk = cfg.chunk_bytes
+
+  let start = now_ns()
+
+  let mut i: u32 = 0
+  while i < cfg.tasks
+    let txi = mpsc.clone_sender(tx)
+    let _h = spawn.spawn(rt, fn() -> u64
+      # Per-task: one copy iteration
+      let src = iobytes.bytes_repeat(0xCDu8, size)
+      let r = iobuf.reader_from_bytes(src)
+      let w = iobuf.writer_memory()
+      let n = iocopy.copy_buf(r, w, chunk)
+      mpsc.send(txi, n)
+      ret n
+    .end)
+    i = i + 1
+  .end
+
+  let mut total_bytes: u64 = 0
+  let mut done: u32 = 0
+  while done < cfg.tasks
+    let v = mpsc.recv(rx)
+    if mpsc.is_none(v)
+      ret rtres.err(CopyBenchError.IoFailed)
+    .end
+    total_bytes = total_bytes + mpsc.unwrap(v)
+    done = done + 1
+  .end
+
+  let end = now_ns()
+  let elapsed = end - start
+
+  ret rtres.ok(CopyBenchStats
+    iters: cfg.tasks as u64
+    bytes_total: total_bytes
+    elapsed_ns: elapsed
+    bytes_per_sec: bytes_per_sec(total_bytes, elapsed)
+    ns_per_mb: ns_per_mb(total_bytes, elapsed)
+    ns_per_iter: ns_per_iter(cfg.tasks as u64, elapsed)
+  .end)
+.end
+
+# ----------------------------------------------------------------------------
+# CLI-ish entry
+# ----------------------------------------------------------------------------
+
+fn default_cfg() -> CopyBenchConfig
+  ret CopyBenchConfig
+    name: "mem_to_mem"
+    warmup_iters: 50
+    iters: 200
+    size_bytes: 64 * 1024 * 1024
+    chunk_bytes: 16 * 1024
+    tasks: 512
+    workers: 0
+    blocking_threads: 0
+    use_files: false
+    spawned: false
+    verbose: false
+    json: false
+  .end
+.end
+
+fn run(cfg: CopyBenchConfig) -> rtres.Result[CopyBenchStats, CopyBenchError]
+  let rtr = build_runtime(cfg)
+  if rtres.is_err(rtr)
+    ret rtres.err(CopyBenchError.RuntimeInitFailed)
+  .end
+  let rt = rtres.unwrap(rtr)
+
+  # Warmup
+  if cfg.warmup_iters > 0
+    let mut wcfg = cfg
+    wcfg.iters = cfg.warmup_iters
+    wcfg.warmup_iters = 0
+    let _ = if wcfg.name == "mem_to_mem"
+      bench_mem_to_mem(wcfg, rt)
+    elif wcfg.name == "zero_to_null"
+      bench_zero_to_null(wcfg, rt)
+    elif wcfg.name == "file_to_file"
+      bench_file_to_file(wcfg, rt)
+    else
+      bench_mem_to_mem(wcfg, rt)
+    .end
+  .end
+
+  if cfg.spawned
+    ret bench_spawned_many(cfg, rt)
+  .end
+
+  if cfg.name == "mem_to_mem"
+    ret bench_mem_to_mem(cfg, rt)
+  .end
+  if cfg.name == "zero_to_null"
+    ret bench_zero_to_null(cfg, rt)
+  .end
+  if cfg.name == "file_to_file"
+    ret bench_file_to_file(cfg, rt)
+  .end
+
+  ret bench_mem_to_mem(cfg, rt)
+.end
+
+fn print_stats(cfg: CopyBenchConfig, s: CopyBenchStats)
+  if cfg.json
+    rtlog.info("bench.json", "TODO")
+    ret
+  .end
+  rtlog.info("bench.case", cfg.name)
+  rtlog.info("bench.iters", rtlog.fmt_u64(s.iters))
+  rtlog.info("bench.bytes_total", rtlog.fmt_u64(s.bytes_total))
+  rtlog.info("bench.elapsed_ns", rtlog.fmt_u64(s.elapsed_ns))
+  rtlog.info("bench.bytes_per_sec", rtlog.fmt_u64(s.bytes_per_sec))
+  rtlog.info("bench.ns_per_mb", rtlog.fmt_u64(s.ns_per_mb))
+  rtlog.info("bench.ns_per_iter", rtlog.fmt_u64(s.ns_per_iter))
+.end
+
+fn main(args: [str]) -> i32
+  let cfg = default_cfg()
+  # TODO: parse args -> cfg:
+  #   --case mem_to_mem|zero_to_null|file_to_file
+  #   --iters N --warmup N --size BYTES --chunk BYTES
+  #   --spawned --tasks N --workers N --files
+  #   --json --verbose
+
+  if cfg.workers == 0
+    cfg.workers = 4
+  .end
+
+  let res = run(cfg)
+  if rtres.is_err(res)
+    rtlog.error("bench.fail", "io_copy failed")
+    ret 1
+  .end
+
+  let s = rtres.unwrap(res)
+  print_stats(cfg, s)
+  ret 0
+.end
+
+.end

@@ -1,0 +1,398 @@
+module ray.runtime.bench.b_mpsc
+
+import runtime.core.rt_result as rtres
+import runtime.core.rt_logging as rtlog
+import runtime.time.time_instant as tinst
+
+import runtime.executor.exec_builder as execb
+import runtime.executor.exec_runtime as exec
+import runtime.executor.exec_spawn as spawn
+import runtime.task.task_join as join
+
+import runtime.sync.sync_mpsc as mpsc
+import runtime.sync.sync_notify as notify
+import runtime.async.yield_now as yn
+
+# ============================================================================
+# ray-runtime/bench/b_mpsc.vitte — MPSC benchmark suite (Tokio-like)
+#
+# Mesure:
+#   - throughput send/recv (1 prod -> 1 cons)
+#   - multi-producers (N prod -> 1 cons)
+#   - bounded vs unbounded (si support)
+#   - batch send (amortization)
+#   - fairness (yield / contention)
+#   - latency ping (optional)
+#
+# Résultats:
+#   - msgs/s, ns/msg, ns/batch, backpressure signal (si bounded)
+#
+# Notes:
+#   - APIs MPSC sont placeholders: adapter aux signatures réelles de runtime.sync.sync_mpsc
+#   - Aucun `{}`. Blocs `.end`.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Types
+# ----------------------------------------------------------------------------
+
+type BenchId = u32
+
+struct MpscBenchConfig
+  name: str
+  warmup_iters: u64
+  iters: u64            # messages per producer (ou total selon bench)
+  producers: u32
+  capacity: u32         # 0 => unbounded (si support)
+  batch: u32            # msgs per loop
+  payload_bytes: u32
+  workers: u32
+  blocking_threads: u32
+  yield_every: u32      # 0 => never
+  verbose: bool
+  json: bool
+.end
+
+struct MpscBenchStats
+  iters: u64
+  msgs_total: u64
+  elapsed_ns: u64
+  msgs_per_sec: u64
+  ns_per_msg: u64
+  ns_per_batch: u64
+.end
+
+enum MpscBenchError
+  InvalidArgs
+  RuntimeInitFailed
+  ChannelInitFailed
+  BenchFailed
+.end
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+
+fn now_ns() -> u64
+  let t = tinst.now()
+  ret tinst.to_unix_nanos(t)
+.end
+
+fn msgs_per_sec(msgs: u64, elapsed_ns: u64) -> u64
+  if elapsed_ns == 0
+    ret 0
+  .end
+  ret (msgs * 1_000_000_000) / elapsed_ns
+.end
+
+fn ns_per_msg(msgs: u64, elapsed_ns: u64) -> u64
+  if msgs == 0
+    ret 0
+  .end
+  ret elapsed_ns / msgs
+.end
+
+fn ns_per_batch(batches: u64, elapsed_ns: u64) -> u64
+  if batches == 0
+    ret 0
+  .end
+  ret elapsed_ns / batches
+.end
+
+# Payload generator (avoid constant folding)
+fn payload_make(n: u32) -> [u8]
+  if n == 0
+    ret []
+  .end
+  let mut b = mpsc.bytes_alloc(n)     # placeholder helper; replace with std bytes
+  let mut i: u32 = 0
+  while i < n
+    b[i] = (i & 0xFF) as u8
+    i = i + 1
+  .end
+  ret b
+.end
+
+# ----------------------------------------------------------------------------
+# Runtime init
+# ----------------------------------------------------------------------------
+
+fn build_runtime(cfg: MpscBenchConfig) -> rtres.Result[exec.Runtime, MpscBenchError]
+  let mut b = execb.builder()
+  execb.set_workers(b, cfg.workers)
+  execb.set_blocking_threads(b, cfg.blocking_threads)
+  execb.set_name(b, "ray-mpsc-bench")
+  let r = execb.build(b)
+  if rtres.is_err(r)
+    ret rtres.err(MpscBenchError.RuntimeInitFailed)
+  .end
+  ret rtres.ok(rtres.unwrap(r))
+.end
+
+# ----------------------------------------------------------------------------
+# Bench A: 1 producer -> 1 consumer throughput
+# ----------------------------------------------------------------------------
+
+fn bench_1p1c(cfg: MpscBenchConfig, rt: exec.Runtime) -> rtres.Result[MpscBenchStats, MpscBenchError]
+  if cfg.iters == 0
+    ret rtres.err(MpscBenchError.InvalidArgs)
+  .end
+  if cfg.batch == 0
+    ret rtres.err(MpscBenchError.InvalidArgs)
+  .end
+
+  let (tx, rx) = if cfg.capacity == 0
+    mpsc.channel_unbounded()
+  else
+    mpsc.channel_bounded(cfg.capacity)
+  .end
+
+  if mpsc.is_invalid(tx) or mpsc.is_invalid(rx)
+    ret rtres.err(MpscBenchError.ChannelInitFailed)
+  .end
+
+  let total_msgs: u64 = cfg.iters
+  let batches: u64 = (total_msgs + (cfg.batch as u64) - 1) / (cfg.batch as u64)
+
+  let payload = payload_make(cfg.payload_bytes)
+
+  # Consumer task
+  let done = notify.Notify.new()
+  let hc = spawn.spawn(rt, fn() -> u64
+    let mut got: u64 = 0
+    while got < total_msgs
+      let v = mpsc.recv(rx)
+      if mpsc.is_none(v)
+        break
+      .end
+      got = got + 1
+      if cfg.yield_every != 0 and ((got as u32) % cfg.yield_every) == 0
+        yn.yield_now()
+      .end
+    .end
+    notify.notify_one(done)
+    ret got
+  .end)
+
+  # Producer inline (to isolate send cost)
+  let start = now_ns()
+  let mut sent: u64 = 0
+  while sent < total_msgs
+    let mut j: u32 = 0
+    while j < cfg.batch and sent < total_msgs
+      mpsc.send(tx, payload)     # placeholder: send copies or references depending impl
+      sent = sent + 1
+      j = j + 1
+    .end
+    if cfg.yield_every != 0 and ((sent as u32) % cfg.yield_every) == 0
+      yn.yield_now()
+    .end
+  .end
+
+  # Wait consumer
+  notify.wait(done)
+  let end = now_ns()
+
+  let _ = join.block_on(rt, hc)
+
+  let elapsed = end - start
+
+  ret rtres.ok(MpscBenchStats
+    iters: total_msgs
+    msgs_total: total_msgs
+    elapsed_ns: elapsed
+    msgs_per_sec: msgs_per_sec(total_msgs, elapsed)
+    ns_per_msg: ns_per_msg(total_msgs, elapsed)
+    ns_per_batch: ns_per_batch(batches, elapsed)
+  .end)
+.end
+
+# ----------------------------------------------------------------------------
+# Bench B: N producers -> 1 consumer
+# ----------------------------------------------------------------------------
+
+fn bench_np1c(cfg: MpscBenchConfig, rt: exec.Runtime) -> rtres.Result[MpscBenchStats, MpscBenchError]
+  if cfg.producers == 0
+    ret rtres.err(MpscBenchError.InvalidArgs)
+  .end
+  if cfg.iters == 0 or cfg.batch == 0
+    ret rtres.err(MpscBenchError.InvalidArgs)
+  .end
+
+  let (tx0, rx) = if cfg.capacity == 0
+    mpsc.channel_unbounded()
+  else
+    mpsc.channel_bounded(cfg.capacity)
+  .end
+
+  if mpsc.is_invalid(tx0) or mpsc.is_invalid(rx)
+    ret rtres.err(MpscBenchError.ChannelInitFailed)
+  .end
+
+  let per_prod: u64 = cfg.iters
+  let total_msgs: u64 = per_prod * (cfg.producers as u64)
+  let batches: u64 = (total_msgs + (cfg.batch as u64) - 1) / (cfg.batch as u64)
+
+  let payload = payload_make(cfg.payload_bytes)
+
+  # Consumer
+  let done = notify.Notify.new()
+  let hc = spawn.spawn(rt, fn() -> u64
+    let mut got: u64 = 0
+    while got < total_msgs
+      let v = mpsc.recv(rx)
+      if mpsc.is_none(v)
+        break
+      .end
+      got = got + 1
+      if cfg.yield_every != 0 and ((got as u32) % cfg.yield_every) == 0
+        yn.yield_now()
+      .end
+    .end
+    notify.notify_one(done)
+    ret got
+  .end)
+
+  # Producers
+  let mut joins = join.JoinSet.new()
+
+  let start = now_ns()
+
+  let mut p: u32 = 0
+  while p < cfg.producers
+    let tx = mpsc.clone_sender(tx0)
+    let _h = spawn.spawn(rt, fn() -> u64
+      let mut sent: u64 = 0
+      while sent < per_prod
+        let mut j: u32 = 0
+        while j < cfg.batch and sent < per_prod
+          mpsc.send(tx, payload)
+          sent = sent + 1
+          j = j + 1
+        .end
+        if cfg.yield_every != 0 and ((sent as u32) % cfg.yield_every) == 0
+          yn.yield_now()
+        .end
+      .end
+      ret sent
+    .end)
+    join.push(joins, _h)
+    p = p + 1
+  .end
+
+  # Join producers
+  let mut joined: u32 = 0
+  while joined < cfg.producers
+    let r = join.next(joins)
+    if join.is_none(r)
+      ret rtres.err(MpscBenchError.BenchFailed)
+    .end
+    joined = joined + 1
+  .end
+
+  # Wait consumer
+  notify.wait(done)
+  let end = now_ns()
+
+  let _ = join.block_on(rt, hc)
+
+  let elapsed = end - start
+
+  ret rtres.ok(MpscBenchStats
+    iters: total_msgs
+    msgs_total: total_msgs
+    elapsed_ns: elapsed
+    msgs_per_sec: msgs_per_sec(total_msgs, elapsed)
+    ns_per_msg: ns_per_msg(total_msgs, elapsed)
+    ns_per_batch: ns_per_batch(batches, elapsed)
+  .end)
+.end
+
+# ----------------------------------------------------------------------------
+# Dispatcher
+# ----------------------------------------------------------------------------
+
+fn default_cfg() -> MpscBenchConfig
+  ret MpscBenchConfig
+    name: "1p1c"
+    warmup_iters: 200_000
+    iters: 1_000_000
+    producers: 4
+    capacity: 1024
+    batch: 64
+    payload_bytes: 0
+    workers: 0
+    blocking_threads: 0
+    yield_every: 0
+    verbose: false
+    json: false
+  .end
+.end
+
+fn run(cfg: MpscBenchConfig) -> rtres.Result[MpscBenchStats, MpscBenchError]
+  let rtr = build_runtime(cfg)
+  if rtres.is_err(rtr)
+    ret rtres.err(MpscBenchError.RuntimeInitFailed)
+  .end
+  let rt = rtres.unwrap(rtr)
+
+  # Warmup
+  if cfg.warmup_iters > 0
+    let mut wcfg = cfg
+    wcfg.iters = cfg.warmup_iters
+    wcfg.warmup_iters = 0
+    let _ = if wcfg.name == "1p1c"
+      bench_1p1c(wcfg, rt)
+    else
+      bench_np1c(wcfg, rt)
+    .end
+  .end
+
+  if cfg.name == "1p1c"
+    ret bench_1p1c(cfg, rt)
+  .end
+  if cfg.name == "np1c"
+    ret bench_np1c(cfg, rt)
+  .end
+
+  ret bench_1p1c(cfg, rt)
+.end
+
+fn print_stats(cfg: MpscBenchConfig, s: MpscBenchStats)
+  if cfg.json
+    rtlog.info("bench.json", "TODO")
+    ret
+  .end
+
+  rtlog.info("bench.case", cfg.name)
+  rtlog.info("bench.msgs_total", rtlog.fmt_u64(s.msgs_total))
+  rtlog.info("bench.elapsed_ns", rtlog.fmt_u64(s.elapsed_ns))
+  rtlog.info("bench.msgs_per_sec", rtlog.fmt_u64(s.msgs_per_sec))
+  rtlog.info("bench.ns_per_msg", rtlog.fmt_u64(s.ns_per_msg))
+  rtlog.info("bench.ns_per_batch", rtlog.fmt_u64(s.ns_per_batch))
+.end
+
+fn main(args: [str]) -> i32
+  let cfg = default_cfg()
+  # TODO parse args:
+  #   --case 1p1c|np1c
+  #   --iters N --warmup N --producers N --capacity N --batch N
+  #   --payload N --yield-every N
+  #   --workers N --json --verbose
+
+  if cfg.workers == 0
+    cfg.workers = 4
+  .end
+
+  let res = run(cfg)
+  if rtres.is_err(res)
+    rtlog.error("bench.fail", "mpsc bench failed")
+    ret 1
+  .end
+
+  let s = rtres.unwrap(res)
+  print_stats(cfg, s)
+  ret 0
+.end
+
+.end

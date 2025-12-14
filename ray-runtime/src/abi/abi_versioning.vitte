@@ -1,0 +1,375 @@
+module ray.runtime.abi.abi_versioning
+
+import ray.runtime.abi.abi_errors as abie
+import ray.runtime.abi.abi_result as abir
+import ray.runtime.abi.abi_strings as abistr
+import ray.runtime.abi.abi_slices as abis
+import ray.runtime.abi.abi_types as abit
+
+# ============================================================================
+# ray-runtime/src/abi/abi_versioning.vitte — ABI versioning & compatibility (MAX)
+#
+# Objectifs:
+#   - Définir les règles de versioning ABI pour ray-runtime:
+#       * version runtime (semver) + build id
+#       * version ABI (major/minor) + compat policy
+#       * handshake host <-> runtime <-> plugin
+#       * “caps” (capabilities) + feature flags (stable)
+#   - Fournir des structures d’échange (struct-only) et helpers purs.
+#
+# Contraintes:
+#   - Pas d’I/O
+#   - Pas d’alloc implicite
+#   - Compat ABI: ajouts en fin uniquement
+#   - Aucun `{}` ; blocs `.end`
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Aliases
+# ----------------------------------------------------------------------------
+
+type AbiU8   = u8
+type AbiU16  = u16
+type AbiU32  = u32
+type AbiU64  = u64
+type AbiI32  = i32
+type AbiBool = bool
+
+type AbiStatus = abie.AbiStatus
+const ABI_OK: AbiStatus = abie.ABI_OK
+
+type AbiStrView = abis.AbiStrView
+
+# ----------------------------------------------------------------------------
+# ABI version model
+# ----------------------------------------------------------------------------
+# Policy:
+#   - abi_major: breaking ABI changes (layout/meaning changes)
+#   - abi_minor: backward compatible additions (new fields at end, new funcs)
+#   - runtime version: product semver (independent, can move faster)
+#
+# Compatibility rule (default):
+#   - require same abi_major
+#   - allow got.abi_minor >= expected.abi_minor (runtime newer ok)
+#   - disallow older minor if host expects newer features (negotiable)
+
+struct AbiAbiVersion
+  major: AbiU16
+  minor: AbiU16
+  reserved0: AbiU32
+.end
+
+fn abi_version_make(major: AbiU16, minor: AbiU16) -> AbiAbiVersion
+  ret AbiAbiVersion major: major minor: minor reserved0: 0 .end
+.end
+
+# ----------------------------------------------------------------------------
+# Runtime product version (semver)
+# ----------------------------------------------------------------------------
+
+struct AbiSemVer
+  major: AbiU16
+  minor: AbiU16
+  patch: AbiU16
+  reserved0: AbiU16
+.end
+
+fn semver(maj: AbiU16, min: AbiU16, pat: AbiU16) -> AbiSemVer
+  ret AbiSemVer major: maj minor: min patch: pat reserved0: 0 .end
+.end
+
+# ----------------------------------------------------------------------------
+# Build identity
+# ----------------------------------------------------------------------------
+
+type AbiBuildId = abit.AbiBuildId
+
+struct AbiBuildInfo
+  build_id: AbiBuildId
+  commit_id: AbiU64          # truncated hash if desired
+  build_ts_unix: AbiU64      # seconds since epoch
+  flags: AbiU32
+  reserved0: AbiU32
+.end
+
+const ABI_BUILD_FLAG_DIRTY: AbiU32 = 1 << 0
+const ABI_BUILD_FLAG_DEV: AbiU32   = 1 << 1
+const ABI_BUILD_FLAG_CI: AbiU32    = 1 << 2
+
+# ----------------------------------------------------------------------------
+# Capabilities (feature negotiation)
+# ----------------------------------------------------------------------------
+# caps0/caps1 are stable bitsets:
+#   - caps0: runtime core capabilities
+#   - caps1: io/net/fs advanced
+# Extend with caps2/caps3 later at end of struct.
+
+type AbiCaps = AbiU64
+
+const CAP0_TASK_SPAWN: AbiCaps         = 1ull << 0
+const CAP0_TASK_CANCEL: AbiCaps        = 1ull << 1
+const CAP0_TIMERS: AbiCaps             = 1ull << 2
+const CAP0_ASYNC_IO: AbiCaps           = 1ull << 3
+const CAP0_NET_TCP: AbiCaps            = 1ull << 4
+const CAP0_FS_BASIC: AbiCaps           = 1ull << 5
+const CAP0_PROCESS: AbiCaps            = 1ull << 6
+const CAP0_SIGNAL: AbiCaps             = 1ull << 7
+const CAP0_PLUGINS: AbiCaps            = 1ull << 8
+const CAP0_POLL_EPOLL: AbiCaps         = 1ull << 9
+const CAP0_POLL_KQUEUE: AbiCaps        = 1ull << 10
+const CAP0_POLL_IOCP: AbiCaps          = 1ull << 11
+const CAP0_METRICS: AbiCaps            = 1ull << 12
+
+const CAP1_TCP_NODELAY: AbiCaps        = 1ull << 0
+const CAP1_TCP_REUSEADDR: AbiCaps      = 1ull << 1
+const CAP1_IO_ZERO_COPY: AbiCaps       = 1ull << 2
+const CAP1_TIMER_COALESCING: AbiCaps   = 1ull << 3
+const CAP1_DNS: AbiCaps                = 1ull << 4
+const CAP1_TLS: AbiCaps                = 1ull << 5
+
+struct AbiCapabilities
+  caps0: AbiCaps
+  caps1: AbiCaps
+  reserved0: AbiU64
+  reserved1: AbiU64
+.end
+
+fn caps_empty() -> AbiCapabilities
+  ret AbiCapabilities caps0: 0 caps1: 0 reserved0: 0 reserved1: 0 .end
+.end
+
+fn caps_has0(c: AbiCapabilities, bit: AbiCaps) -> AbiBool
+  ret (c.caps0 & bit) != 0
+.end
+
+fn caps_has1(c: AbiCapabilities, bit: AbiCaps) -> AbiBool
+  ret (c.caps1 & bit) != 0
+.end
+
+# ----------------------------------------------------------------------------
+# ABI handshake records
+# ----------------------------------------------------------------------------
+
+enum AbiPartyKind
+  Host = 1
+  Runtime = 2
+  Plugin = 3
+.end
+
+struct AbiPartyInfo
+  kind: AbiPartyKind
+  abi: AbiAbiVersion
+  product: AbiSemVer
+  build: AbiBuildInfo
+  name: AbiStrView       # e.g. "ray-runtime"
+  vendor: AbiStrView     # optional
+  reserved0: AbiU64
+.end
+
+fn party_info_none(kind: AbiPartyKind) -> AbiPartyInfo
+  ret AbiPartyInfo
+    kind: kind
+    abi: abi_version_make(1, 0)
+    product: semver(0, 0, 0)
+    build: AbiBuildInfo build_id: 0 commit_id: 0 build_ts_unix: 0 flags: 0 reserved0: 0 .end
+    name: abis.empty_str()
+    vendor: abis.empty_str()
+    reserved0: 0
+  .end
+.end
+
+struct AbiHandshake
+  host: AbiPartyInfo
+  runtime: AbiPartyInfo
+  plugin: AbiPartyInfo
+  caps: AbiCapabilities
+
+  policy: AbiU32
+  flags: AbiU32
+
+  reserved0: AbiU64
+  reserved1: AbiU64
+.end
+
+# policy bits
+const ABI_POLICY_STRICT_MINOR: AbiU32 = 1 << 0  # require exact minor
+const ABI_POLICY_ALLOW_OLD_MINOR: AbiU32 = 1 << 1 # allow older minor (danger)
+const ABI_POLICY_REQUIRE_CAPS: AbiU32 = 1 << 2     # validate caps for requested features
+
+# flags
+const ABI_HS_FLAG_HAS_PLUGIN: AbiU32 = 1 << 0
+const ABI_HS_FLAG_DEBUG: AbiU32      = 1 << 1
+
+fn handshake_empty() -> AbiHandshake
+  ret AbiHandshake
+    host: party_info_none(AbiPartyKind.Host)
+    runtime: party_info_none(AbiPartyKind.Runtime)
+    plugin: party_info_none(AbiPartyKind.Plugin)
+    caps: caps_empty()
+    policy: 0
+    flags: 0
+    reserved0: 0
+    reserved1: 0
+  .end
+.end
+
+# ----------------------------------------------------------------------------
+# Compatibility report
+# ----------------------------------------------------------------------------
+
+struct AbiVersionReport
+  ok: AbiBool
+  status: AbiStatus
+  error: abie.AbiError
+
+  expected_major: AbiU16
+  expected_minor: AbiU16
+  got_major: AbiU16
+  got_minor: AbiU16
+
+  reserved0: AbiU64
+.end
+
+fn version_report_ok(v: AbiAbiVersion) -> AbiVersionReport
+  ret AbiVersionReport
+    ok: true
+    status: ABI_OK
+    error: abie.abi_error_ok()
+    expected_major: v.major
+    expected_minor: v.minor
+    got_major: v.major
+    got_minor: v.minor
+    reserved0: 0
+  .end
+.end
+
+fn version_report_fail(exp: AbiAbiVersion, got: AbiAbiVersion) -> AbiVersionReport
+  let e = abie.abi_error_incompat(abie.AbiErrorDomain.Plugin, (exp.major as AbiU32) << 16 | (exp.minor as AbiU32), (got.major as AbiU32) << 16 | (got.minor as AbiU32), abie.MSG_PLUGIN_INCOMPAT)
+  ret AbiVersionReport
+    ok: false
+    status: abie.ABI_EOPNOTSUPP
+    error: e
+    expected_major: exp.major
+    expected_minor: exp.minor
+    got_major: got.major
+    got_minor: got.minor
+    reserved0: 0
+  .end
+.end
+
+# ----------------------------------------------------------------------------
+# Version compatibility check (policy-driven)
+# ----------------------------------------------------------------------------
+
+fn abi_is_compatible(expected: AbiAbiVersion, got: AbiAbiVersion, policy: AbiU32) -> AbiVersionReport
+  if expected.major != got.major
+    ret version_report_fail(expected, got)
+  .end
+
+  # strict minor
+  if (policy & ABI_POLICY_STRICT_MINOR) != 0
+    if expected.minor != got.minor
+      ret version_report_fail(expected, got)
+    .end
+    ret version_report_ok(expected)
+  .end
+
+  # default: runtime newer minor ok
+  if got.minor < expected.minor
+    # allow old minor only if explicitly permitted
+    if (policy & ABI_POLICY_ALLOW_OLD_MINOR) != 0
+      ret version_report_ok(expected)
+    .end
+    ret version_report_fail(expected, got)
+  .end
+
+  ret version_report_ok(expected)
+.end
+
+# ----------------------------------------------------------------------------
+# Capabilities validation (requested vs provided)
+# ----------------------------------------------------------------------------
+
+struct AbiCapsReport
+  ok: AbiBool
+  status: AbiStatus
+  error: abie.AbiError
+  missing0: AbiCaps
+  missing1: AbiCaps
+  reserved0: AbiU64
+.end
+
+fn caps_report_ok() -> AbiCapsReport
+  ret AbiCapsReport ok: true status: ABI_OK error: abie.abi_error_ok() missing0: 0 missing1: 0 reserved0: 0 .end
+.end
+
+fn caps_report_fail(m0: AbiCaps, m1: AbiCaps) -> AbiCapsReport
+  let msg = abie.msg_id(abie.AbiErrorDomain.Config, abie.AbiErrorClass.Unsupported, 1)
+  let mut e = abie.abi_error_from_status(abie.ABI_EOPNOTSUPP, abie.AbiErrorDomain.Config, msg)
+  e = abie.abi_error_with_ctx(e, m0 as AbiU64, m1 as AbiU64, 0, 0)
+  ret AbiCapsReport ok: false status: abie.ABI_EOPNOTSUPP error: e missing0: m0 missing1: m1 reserved0: 0 .end
+.end
+
+fn caps_require(provided: AbiCapabilities, req0: AbiCaps, req1: AbiCaps) -> AbiCapsReport
+  let m0 = req0 & ~provided.caps0
+  let m1 = req1 & ~provided.caps1
+  if m0 == 0 and m1 == 0
+    ret caps_report_ok()
+  .end
+  ret caps_report_fail(m0, m1)
+.end
+
+# ----------------------------------------------------------------------------
+# Full handshake validation
+# ----------------------------------------------------------------------------
+
+struct AbiHandshakeReport
+  ok: AbiBool
+  status: AbiStatus
+  error: abie.AbiError
+
+  ver: AbiVersionReport
+  caps: AbiCapsReport
+
+  reserved0: AbiU64
+.end
+
+fn hs_report_ok() -> AbiHandshakeReport
+  ret AbiHandshakeReport
+    ok: true
+    status: ABI_OK
+    error: abie.abi_error_ok()
+    ver: version_report_ok(abi_version_make(1, 0))
+    caps: caps_report_ok()
+    reserved0: 0
+  .end
+.end
+
+fn hs_report_fail(e: abie.AbiError, st: AbiStatus, vr: AbiVersionReport, cr: AbiCapsReport) -> AbiHandshakeReport
+  ret AbiHandshakeReport ok: false status: st error: e ver: vr caps: cr reserved0: 0 .end
+.end
+
+fn validate_handshake(hs: AbiHandshake, expected_runtime_abi: AbiAbiVersion, req_caps0: AbiCaps, req_caps1: AbiCaps) -> AbiHandshakeReport
+  let vr = abi_is_compatible(expected_runtime_abi, hs.runtime.abi, hs.policy)
+  if not vr.ok
+    ret hs_report_fail(vr.error, vr.status, vr, caps_report_ok())
+  .end
+
+  if (hs.policy & ABI_POLICY_REQUIRE_CAPS) != 0
+    let cr = caps_require(hs.caps, req_caps0, req_caps1)
+    if not cr.ok
+      ret hs_report_fail(cr.error, cr.status, vr, cr)
+    .end
+  .end
+
+  ret AbiHandshakeReport
+    ok: true
+    status: ABI_OK
+    error: abie.abi_error_ok()
+    ver: vr
+    caps: caps_report_ok()
+    reserved0: 0
+  .end
+.end
+
+.end

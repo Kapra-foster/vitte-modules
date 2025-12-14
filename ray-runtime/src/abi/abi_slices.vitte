@@ -1,0 +1,212 @@
+module ray.runtime.abi.abi_slices
+
+import ray.runtime.abi.abi_errors as abie
+import ray.runtime.abi.abi_result as abir
+
+# ============================================================================
+# ray-runtime/src/abi/abi_slices.vitte — ABI slices/strings/buffers (MAX)
+#
+# Objectifs:
+#   - Définir des vues mémoire ABI-safe:
+#       * slice<T> (ptr+len)
+#       * mut_slice<T>
+#       * str_view (utf8, non-0-terminated)
+#       * cstr_view (0-terminated, optionnel)
+#   - Fournir helpers purs:
+#       * validation (ptr/len, overflow)
+#       * conversions "raw ptr as u64"
+#       * split/trim (sans allocations)
+#       * copy helpers (memcpy-like placeholders)
+#
+# Contraintes:
+#   - Pure data + helpers (pas d'I/O)
+#   - Compat ABI: ajouter champs en fin
+#   - Aucun `{}` ; blocs `.end`
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Aliases
+# ----------------------------------------------------------------------------
+
+type AbiU8  = u8
+type AbiU16 = u16
+type AbiU32 = u32
+type AbiU64 = u64
+type AbiI32 = i32
+type AbiI64 = i64
+type AbiBool = bool
+
+type AbiPtr = AbiU64     # pointer-as-u64 in ABI
+type AbiSize = AbiU64
+
+type AbiStatus = abie.AbiStatus
+const ABI_OK: AbiStatus = abie.ABI_OK
+
+# ----------------------------------------------------------------------------
+# Slice primitives
+# ----------------------------------------------------------------------------
+
+struct AbiSliceU8
+  ptr: AbiPtr
+  len: AbiU64
+.end
+
+struct AbiMutSliceU8
+  ptr: AbiPtr
+  len: AbiU64
+.end
+
+struct AbiSliceU32
+  ptr: AbiPtr
+  len: AbiU64
+.end
+
+struct AbiMutSliceU32
+  ptr: AbiPtr
+  len: AbiU64
+.end
+
+struct AbiSliceU64
+  ptr: AbiPtr
+  len: AbiU64
+.end
+
+struct AbiMutSliceU64
+  ptr: AbiPtr
+  len: AbiU64
+.end
+
+# Generic view: for FFI generators (type_id encoded elsewhere)
+struct AbiSliceAny
+  elem_size: AbiU32
+  elem_align: AbiU32
+  ptr: AbiPtr
+  len: AbiU64
+.end
+
+struct AbiMutSliceAny
+  elem_size: AbiU32
+  elem_align: AbiU32
+  ptr: AbiPtr
+  len: AbiU64
+.end
+
+# ----------------------------------------------------------------------------
+# String views
+# ----------------------------------------------------------------------------
+
+struct AbiStrView
+  ptr: AbiPtr
+  len: AbiU64
+.end
+
+struct AbiCStrView
+  ptr: AbiPtr
+.end
+
+# ----------------------------------------------------------------------------
+# Constructors
+# ----------------------------------------------------------------------------
+
+fn slice_u8(ptr: AbiPtr, len: AbiU64) -> AbiSliceU8
+  ret AbiSliceU8 ptr: ptr len: len .end
+.end
+
+fn mut_slice_u8(ptr: AbiPtr, len: AbiU64) -> AbiMutSliceU8
+  ret AbiMutSliceU8 ptr: ptr len: len .end
+.end
+
+fn str_view(ptr: AbiPtr, len: AbiU64) -> AbiStrView
+  ret AbiStrView ptr: ptr len: len .end
+.end
+
+fn cstr_view(ptr: AbiPtr) -> AbiCStrView
+  ret AbiCStrView ptr: ptr .end
+.end
+
+fn empty_u8() -> AbiSliceU8
+  ret AbiSliceU8 ptr: 0 len: 0 .end
+.end
+
+fn empty_mut_u8() -> AbiMutSliceU8
+  ret AbiMutSliceU8 ptr: 0 len: 0 .end
+.end
+
+fn empty_str() -> AbiStrView
+  ret AbiStrView ptr: 0 len: 0 .end
+.end
+
+# ----------------------------------------------------------------------------
+# Validation helpers
+# ----------------------------------------------------------------------------
+# Policy:
+#   - ptr==0 acceptable only if len==0
+#   - overflow checks for byte lengths: len * elem_size
+#   - alignment optional checks (best-effort)
+#   - returns AbiStatus or AbiResult (with AbiError)
+# ----------------------------------------------------------------------------
+
+fn checked_mul_u64(a: AbiU64, b: AbiU64) -> (AbiBool, AbiU64)
+  if a == 0 or b == 0
+    ret (true, 0)
+  .end
+  let p = a * b
+  if p / a != b
+    ret (false, 0)
+  .end
+  ret (true, p)
+.end
+
+fn validate_ptr_len(ptr: AbiPtr, len: AbiU64) -> AbiStatus
+  if ptr == 0 and len != 0
+    ret abie.ABI_EINVAL
+  .end
+  ret ABI_OK
+.end
+
+fn validate_slice_any(s: AbiSliceAny) -> AbiStatus
+  if s.elem_size == 0
+    ret abie.ABI_EINVAL
+  .end
+  let st = validate_ptr_len(s.ptr, s.len)
+  if st != ABI_OK
+    ret st
+  .end
+  let (ok, _bytes) = checked_mul_u64(s.len, s.elem_size as AbiU64)
+  if not ok
+    ret abie.ABI_EOVERFLOW
+  .end
+  ret ABI_OK
+.end
+
+fn validate_mut_slice_any(s: AbiMutSliceAny) -> AbiStatus
+  if s.elem_size == 0
+    ret abie.ABI_EINVAL
+  .end
+  let st = validate_ptr_len(s.ptr, s.len)
+  if st != ABI_OK
+    ret st
+  .end
+  let (ok, _bytes) = checked_mul_u64(s.len, s.elem_size as AbiU64)
+  if not ok
+    ret abie.ABI_EOVERFLOW
+  .end
+  ret ABI_OK
+.end
+
+fn validate_str(v: AbiStrView) -> AbiStatus
+  ret validate_ptr_len(v.ptr, v.len)
+.end
+
+# Result wrappers with AbiError (domain=Platform/Runtime depends caller)
+fn validate_str_r(v: AbiStrView, domain: abie.AbiErrorDomain, msg: AbiU32) -> abir.AbiResult
+  let st = validate_str(v)
+  if st == ABI_OK
+    ret abir.ok()
+  .end
+  ret abir.err(abie.abi_error_from_status(st, domain, msg))
+.end
+
+# ----------------------------------------------------------------------------
+# Length in bytes (safe)
+# -----------------------------

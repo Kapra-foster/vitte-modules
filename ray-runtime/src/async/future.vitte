@@ -1,0 +1,601 @@
+# =============================================================================
+# ray-runtime/src/async/future.vitte
+#
+# Future/Task core (inspiré “Rust-like”, mais sans traits ni closures natives).
+#
+# Objectifs:
+# - Définir Poll[T], Context, Waker
+# - Définir Future[T] (fat-pointer: data + vtable)
+# - Fournir adaptateurs + combinators de base (ready, pending, map, then, join2)
+# - Fournir un mini-executor “local” (queue FIFO) pour tests / intégration simple
+#
+# Notes:
+# - Pas d’accolades: blocs fermés par `.end`
+# - Ce fichier évite l’I/O. Les hooks mémoire sont “extern” (runtime).
+# - La vtable est typée par T via génériques: Future[T] transporte les fns poll/drop.
+# =============================================================================
+
+module ray.async.future
+
+# -----------------------------------------------------------------------------
+# Imports (ajuste si tes chemins std diffèrent)
+# -----------------------------------------------------------------------------
+use core/basic
+use core/compare
+use core/collections/vec
+
+# -----------------------------------------------------------------------------
+# ABI / hooks runtime (alloc + free)
+# -----------------------------------------------------------------------------
+# Contrat:
+# - rt_alloc: renvoie une adresse (usize) ou 0 en OOM
+# - rt_free : libère une adresse allouée (size/align doivent matcher)
+extern fn rt_alloc(size: usize, align: usize) -> usize
+extern fn rt_free(ptr: usize, size: usize, align: usize) -> void
+
+fn _align_up(x: usize, a: usize) -> usize
+  if a == 0
+    ret x
+  .end
+  let r = x % a
+  if r == 0
+    ret x
+  .end
+  ret x + (a - r)
+.end
+
+# -----------------------------------------------------------------------------
+# Poll
+# -----------------------------------------------------------------------------
+type Poll[T] = enum
+  Pending
+  Ready(value: T)
+.end
+
+fn poll_is_ready[T](p: Poll[T]) -> bool
+  match p
+    Poll::Pending =>
+      ret false
+    .end
+    Poll::Ready(_) =>
+      ret true
+    .end
+  .end
+.end
+
+# -----------------------------------------------------------------------------
+# Waker (Rust-style vtable: clone/wake/drop)
+# -----------------------------------------------------------------------------
+type WakerVTable = struct
+  clone_fn: fn(data: usize) -> usize
+  wake_fn : fn(data: usize) -> void
+  drop_fn : fn(data: usize) -> void
+.end
+
+type Waker = struct
+  data  : usize
+  vtbl  : WakerVTable
+.end
+
+fn waker_none() -> Waker
+  # “no-op” waker (clone returns same token, wake/drop do nothing)
+  fn _clone(data: usize) -> usize
+    ret data
+  .end
+  fn _wake(_data: usize) -> void
+    ret
+  .end
+  fn _drop(_data: usize) -> void
+    ret
+  .end
+
+  ret Waker {
+    data: 0,
+    vtbl: WakerVTable {
+      clone_fn: _clone,
+      wake_fn : _wake,
+      drop_fn : _drop,
+    },
+  }
+.end
+
+fn waker_clone(w: Waker) -> Waker
+  let nd = w.vtbl.clone_fn(w.data)
+  ret Waker { data: nd, vtbl: w.vtbl }
+.end
+
+fn waker_wake(w: Waker) -> void
+  w.vtbl.wake_fn(w.data)
+.end
+
+fn waker_drop(w: Waker) -> void
+  w.vtbl.drop_fn(w.data)
+.end
+
+# -----------------------------------------------------------------------------
+# Context
+# -----------------------------------------------------------------------------
+type Context = struct
+  waker: Waker
+.end
+
+fn context_with_waker(w: Waker) -> Context
+  ret Context { waker: w }
+.end
+
+# -----------------------------------------------------------------------------
+# Future[T] = fat pointer (data + poll/drop)
+# -----------------------------------------------------------------------------
+type Future[T] = struct
+  data    : usize
+  poll_fn : fn(data: usize, cx: ref mut Context) -> Poll[T]
+  drop_fn : fn(data: usize) -> void
+.end
+
+fn future_poll[T](f: Future[T], cx: ref mut Context) -> Poll[T]
+  ret f.poll_fn(f.data, cx)
+.end
+
+fn future_drop[T](f: Future[T]) -> void
+  f.drop_fn(f.data)
+.end
+
+# -----------------------------------------------------------------------------
+# Future constructors: ready / pending
+# -----------------------------------------------------------------------------
+type _ReadyState[T] = struct
+  done : bool
+  value: T
+.end
+
+fn _ready_poll[T](data: usize, _cx: ref mut Context) -> Poll[T]
+  let st: ref mut _ReadyState[T] = basic.ptr_ref_mut[_ReadyState[T]](data)
+  if st.done
+    # Déjà consommé: on reste Ready avec la valeur inchangée (policy simple).
+    ret Poll::Ready(st.value)
+  .end
+  st.done = true
+  ret Poll::Ready(st.value)
+.end
+
+fn _ready_drop[T](data: usize) -> void
+  # drop “state” — le runtime gère le drop des champs si nécessaire
+  let _sz = basic.size_of[_ReadyState[T]]()
+  let _al = basic.align_of[_ReadyState[T]]()
+  rt_free(data, _sz, _al)
+.end
+
+fn ready[T](value: T) -> Future[T]
+  let sz = basic.size_of[_ReadyState[T]]()
+  let al = basic.align_of[_ReadyState[T]]()
+  let p  = rt_alloc(sz, al)
+  if p == 0
+    # OOM policy: pending éternel plutôt que crash.
+    ret pending[T]()
+  .end
+  let st: ref mut _ReadyState[T] = basic.ptr_ref_mut[_ReadyState[T]](p)
+  st.done = false
+  st.value = value
+  ret Future[T] { data: p, poll_fn: _ready_poll[T], drop_fn: _ready_drop[T] }
+.end
+
+type _PendingState = struct
+  _dummy: u8
+.end
+
+fn _pending_poll[T](_data: usize, _cx: ref mut Context) -> Poll[T]
+  ret Poll::Pending
+.end
+
+fn _pending_drop(_data: usize) -> void
+  ret
+.end
+
+fn pending[T]() -> Future[T]
+  ret Future[T] { data: 0, poll_fn: _pending_poll[T], drop_fn: _pending_drop }
+.end
+
+# -----------------------------------------------------------------------------
+# Combinator: map
+# -----------------------------------------------------------------------------
+type _MapState[A, B] = struct
+  inner : Future[A]
+  func  : fn(x: A) -> B
+  done  : bool
+  out   : B
+.end
+
+fn _map_poll[A, B](data: usize, cx: ref mut Context) -> Poll[B]
+  let st: ref mut _MapState[A, B] = basic.ptr_ref_mut[_MapState[A, B]](data)
+  if st.done
+    ret Poll::Ready(st.out)
+  .end
+
+  let p = future_poll[A](st.inner, cx)
+  match p
+    Poll::Pending =>
+      ret Poll::Pending
+    .end
+    Poll::Ready(v) =>
+      let r = st.func(v)
+      st.out = r
+      st.done = true
+      ret Poll::Ready(st.out)
+    .end
+  .end
+.end
+
+fn _map_drop[A, B](data: usize) -> void
+  let st: ref mut _MapState[A, B] = basic.ptr_ref_mut[_MapState[A, B]](data)
+  future_drop[A](st.inner)
+  let sz = basic.size_of[_MapState[A, B]]()
+  let al = basic.align_of[_MapState[A, B]]()
+  rt_free(data, sz, al)
+.end
+
+fn map[A, B](inner: Future[A], func: fn(x: A) -> B) -> Future[B]
+  let sz = basic.size_of[_MapState[A, B]]()
+  let al = basic.align_of[_MapState[A, B]]()
+  let p  = rt_alloc(sz, al)
+  if p == 0
+    future_drop[A](inner)
+    ret pending[B]()
+  .end
+  let st: ref mut _MapState[A, B] = basic.ptr_ref_mut[_MapState[A, B]](p)
+  st.inner = inner
+  st.func  = func
+  st.done  = false
+  ret Future[B] { data: p, poll_fn: _map_poll[A, B], drop_fn: _map_drop[A, B] }
+.end
+
+# -----------------------------------------------------------------------------
+# Combinator: then (flat_map)
+# -----------------------------------------------------------------------------
+type _ThenState[A, B] = struct
+  a_done : bool
+  innerA : Future[A]
+  mkB    : fn(x: A) -> Future[B]
+  innerB : Future[B]
+  b_set  : bool
+.end
+
+fn _then_poll[A, B](data: usize, cx: ref mut Context) -> Poll[B]
+  let st: ref mut _ThenState[A, B] = basic.ptr_ref_mut[_ThenState[A, B]](data)
+
+  if not st.a_done
+    let pa = future_poll[A](st.innerA, cx)
+    match pa
+      Poll::Pending =>
+        ret Poll::Pending
+      .end
+      Poll::Ready(v) =>
+        st.a_done = true
+        st.innerB = st.mkB(v)
+        st.b_set = true
+      .end
+    .end
+  .end
+
+  if not st.b_set
+    ret Poll::Pending
+  .end
+  ret future_poll[B](st.innerB, cx)
+.end
+
+fn _then_drop[A, B](data: usize) -> void
+  let st: ref mut _ThenState[A, B] = basic.ptr_ref_mut[_ThenState[A, B]](data)
+  future_drop[A](st.innerA)
+  if st.b_set
+    future_drop[B](st.innerB)
+  .end
+  let sz = basic.size_of[_ThenState[A, B]]()
+  let al = basic.align_of[_ThenState[A, B]]()
+  rt_free(data, sz, al)
+.end
+
+fn then[A, B](fa: Future[A], mk: fn(x: A) -> Future[B]) -> Future[B]
+  let sz = basic.size_of[_ThenState[A, B]]()
+  let al = basic.align_of[_ThenState[A, B]]()
+  let p  = rt_alloc(sz, al)
+  if p == 0
+    future_drop[A](fa)
+    ret pending[B]()
+  .end
+  let st: ref mut _ThenState[A, B] = basic.ptr_ref_mut[_ThenState[A, B]](p)
+  st.a_done = false
+  st.innerA = fa
+  st.mkB    = mk
+  st.b_set  = false
+  ret Future[B] { data: p, poll_fn: _then_poll[A, B], drop_fn: _then_drop[A, B] }
+.end
+
+# -----------------------------------------------------------------------------
+# Combinator: join2
+# -----------------------------------------------------------------------------
+type Pair[A, B] = struct
+  a: A
+  b: B
+.end
+
+type _Join2State[A, B] = struct
+  fa: Future[A]
+  fb: Future[B]
+  a_set: bool
+  b_set: bool
+  a_val: A
+  b_val: B
+.end
+
+fn _join2_poll[A, B](data: usize, cx: ref mut Context) -> Poll[Pair[A, B]]
+  let st: ref mut _Join2State[A, B] = basic.ptr_ref_mut[_Join2State[A, B]](data)
+
+  if not st.a_set
+    let pa = future_poll[A](st.fa, cx)
+    match pa
+      Poll::Pending => ret Poll::Pending .end
+      Poll::Ready(v) =>
+        st.a_val = v
+        st.a_set = true
+      .end
+    .end
+  .end
+
+  if not st.b_set
+    let pb = future_poll[B](st.fb, cx)
+    match pb
+      Poll::Pending => ret Poll::Pending .end
+      Poll::Ready(v) =>
+        st.b_val = v
+        st.b_set = true
+      .end
+    .end
+  .end
+
+  if st.a_set and st.b_set
+    ret Poll::Ready(Pair[A, B] { a: st.a_val, b: st.b_val })
+  .end
+
+  ret Poll::Pending
+.end
+
+fn _join2_drop[A, B](data: usize) -> void
+  let st: ref mut _Join2State[A, B] = basic.ptr_ref_mut[_Join2State[A, B]](data)
+  future_drop[A](st.fa)
+  future_drop[B](st.fb)
+  let sz = basic.size_of[_Join2State[A, B]]()
+  let al = basic.align_of[_Join2State[A, B]]()
+  rt_free(data, sz, al)
+.end
+
+fn join2[A, B](fa: Future[A], fb: Future[B]) -> Future[Pair[A, B]]
+  let sz = basic.size_of[_Join2State[A, B]]()
+  let al = basic.align_of[_Join2State[A, B]]()
+  let p  = rt_alloc(sz, al)
+  if p == 0
+    future_drop[A](fa)
+    future_drop[B](fb)
+    ret pending[Pair[A, B]]()
+  .end
+
+  let st: ref mut _Join2State[A, B] = basic.ptr_ref_mut[_Join2State[A, B]](p)
+  st.fa = fa
+  st.fb = fb
+  st.a_set = false
+  st.b_set = false
+  ret Future[Pair[A, B]] { data: p, poll_fn: _join2_poll[A, B], drop_fn: _join2_drop[A, B] }
+.end
+
+# -----------------------------------------------------------------------------
+# Mini Executor local (single-thread) — FIFO queue de tasks
+# -----------------------------------------------------------------------------
+type TaskId = usize
+
+type Task = struct
+  id   : TaskId
+  futi : Future[usize]   # “erased” minimal: ici on exécute des Future[usize] (tests)
+  done : bool
+  out  : usize
+.end
+
+type _ExecState = struct
+  q    : vec.Vec[TaskId]
+  tasks: vec.Vec[Task]
+.end
+
+fn _exec_waker_clone(data: usize) -> usize
+  # data = ptr ExecState
+  ret data
+.end
+
+fn _exec_waker_wake(data: usize) -> void
+  # Convention: on pousse “0” = tick (réveille la loop); pour simplifier
+  let st: ref mut _ExecState = basic.ptr_ref_mut[_ExecState](data)
+  vec.push[TaskId](st.q, 0)
+.end
+
+fn _exec_waker_drop(_data: usize) -> void
+  ret
+.end
+
+fn _exec_make_waker(exec_ptr: usize) -> Waker
+  ret Waker {
+    data: exec_ptr,
+    vtbl: WakerVTable {
+      clone_fn: _exec_waker_clone,
+      wake_fn : _exec_waker_wake,
+      drop_fn : _exec_waker_drop,
+    },
+  }
+.end
+
+fn executor_new() -> usize
+  let sz = basic.size_of[_ExecState]()
+  let al = basic.align_of[_ExecState]()
+  let p  = rt_alloc(sz, al)
+  if p == 0
+    ret 0
+  .end
+  let st: ref mut _ExecState = basic.ptr_ref_mut[_ExecState](p)
+  st.q     = vec.new[TaskId]()
+  st.tasks = vec.new[Task]()
+  ret p
+.end
+
+fn executor_drop(exec_ptr: usize) -> void
+  if exec_ptr == 0
+    ret
+  .end
+  let st: ref mut _ExecState = basic.ptr_ref_mut[_ExecState](exec_ptr)
+
+  # drop tasks futures
+  let n = vec.len[Task](st.tasks)
+  let mut i: usize = 0
+  while i < n
+    let t = vec.get_ref_mut[Task](st.tasks, i)
+    if not t.done
+      future_drop[usize](t.futi)
+    .end
+    i = i + 1
+  .end
+
+  vec.drop[TaskId](st.q)
+  vec.drop[Task](st.tasks)
+
+  let sz = basic.size_of[_ExecState]()
+  let al = basic.align_of[_ExecState]()
+  rt_free(exec_ptr, sz, al)
+.end
+
+fn executor_spawn(exec_ptr: usize, futi: Future[usize]) -> TaskId
+  let st: ref mut _ExecState = basic.ptr_ref_mut[_ExecState](exec_ptr)
+  let id = vec.len[Task](st.tasks) + 1
+  vec.push[Task](st.tasks, Task { id: id, futi: futi, done: false, out: 0 })
+  vec.push[TaskId](st.q, id)
+  ret id
+.end
+
+fn executor_poll_one(exec_ptr: usize) -> bool
+  let st: ref mut _ExecState = basic.ptr_ref_mut[_ExecState](exec_ptr)
+  if vec.len[TaskId](st.q) == 0
+    ret false
+  .end
+
+  let id = vec.pop_front[TaskId](st.q)
+  if id == 0
+    # tick/no-op
+    ret true
+  .end
+
+  # find task by id (O(n) volontaire)
+  let n = vec.len[Task](st.tasks)
+  let mut i: usize = 0
+  while i < n
+    let t = vec.get_ref_mut[Task](st.tasks, i)
+    if t.id == id
+      if t.done
+        ret true
+      .end
+
+      let w = _exec_make_waker(exec_ptr)
+      let mut cx = context_with_waker(w)
+      let p = future_poll[usize](t.futi, cx)
+      match p
+        Poll::Pending =>
+          # requeue
+          vec.push[TaskId](st.q, id)
+          ret true
+        .end
+        Poll::Ready(v) =>
+          t.done = true
+          t.out = v
+          ret true
+        .end
+      .end
+    .end
+    i = i + 1
+  .end
+
+  ret true
+.end
+
+fn executor_run(exec_ptr: usize, max_steps: usize) -> void
+  let mut steps: usize = 0
+  while steps < max_steps
+    let ok = executor_poll_one(exec_ptr)
+    if not ok
+      ret
+    .end
+    steps = steps + 1
+  .end
+.end
+
+fn executor_take_result(exec_ptr: usize, id: TaskId) -> Poll[usize]
+  let st: ref mut _ExecState = basic.ptr_ref_mut[_ExecState](exec_ptr)
+  let n = vec.len[Task](st.tasks)
+  let mut i: usize = 0
+  while i < n
+    let t = vec.get_ref_mut[Task](st.tasks, i)
+    if t.id == id
+      if t.done
+        ret Poll::Ready(t.out)
+      .end
+      ret Poll::Pending
+    .end
+    i = i + 1
+  .end
+  ret Poll::Pending
+.end
+
+# -----------------------------------------------------------------------------
+# Tests (scenarios)
+# -----------------------------------------------------------------------------
+scn future_ready_poll_once
+  let f = ready
+  let w = waker_none()
+  let mut cx = context_with_waker(w)
+  let p = future_poll[usize](f, cx)
+  match p
+    Poll::Ready(v) =>
+      basic.assert(v == 42)
+    .end
+    Poll::Pending =>
+      basic.panic("expected Ready")
+    .end
+  .end
+  future_drop[usize](f)
+.end
+
+scn future_map_basic
+  fn plus1(x: usize) -> usize
+    ret x + 1
+  .end
+
+  let f0 = ready
+  let f1 = map[usize, usize](f0, plus1)
+  let w = waker_none()
+  let mut cx = context_with_waker(w)
+  let p = future_poll[usize](f1, cx)
+  match p
+    Poll::Ready(v) => basic.assert(v == 2) .end
+    Poll::Pending  => basic.panic("expected Ready") .end
+  .end
+  future_drop[usize](f1)
+.end
+
+scn executor_spawn_and_run
+  let ex = executor_new()
+  basic.assert(ex != 0)
+
+  let f = ready
+  let id = executor_spawn(ex, f)
+
+  executor_run(ex, 16)
+
+  let r = executor_take_result(ex, id)
+  match r
+    Poll::Ready(v) => basic.assert(v == 7) .end
+    Poll::Pending  => basic.panic("expected Ready") .end
+  .end
+
+  executor_drop(ex)
+.end

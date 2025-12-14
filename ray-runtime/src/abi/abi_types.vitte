@@ -1,0 +1,370 @@
+module ray.runtime.abi.abi_types
+
+import ray.runtime.abi.abi_errors as abie
+import ray.runtime.abi.abi_result as abir
+import ray.runtime.abi.abi_slices as abis
+import ray.runtime.abi.abi_strings as abistr
+import ray.runtime.abi.abi_layout as abil
+
+# ============================================================================
+# ray-runtime/src/abi/abi_types.vitte — ABI canonical types & registries (COMPLETE)
+#
+# Objectifs:
+#   - Centraliser les types ABI "canon" utilisés par ray-runtime:
+#       * handles (runtime/task/timer/io/plugin)
+#       * ids (type_id, name_id, file_id, msg_id)
+#       * descriptors (type desc, field desc, enum desc)
+#       * registries (tables statiques, views)
+#       * versioning (abi_version, package ids, build ids)
+#       * conventions d’ownership (borrowed/owned)
+#   - Surface stable pour FFI generators + plugins.
+#
+# Contraintes:
+#   - Pas d’I/O
+#   - Pas d’alloc implicite
+#   - Compat ABI: ajouter des champs en fin uniquement
+#   - Aucun `{}` ; blocs `.end`
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic aliases
+# ----------------------------------------------------------------------------
+
+type AbiU8   = u8
+type AbiU16  = u16
+type AbiU32  = u32
+type AbiU64  = u64
+type AbiI32  = i32
+type AbiI64  = i64
+type AbiBool = bool
+
+type AbiStatus = abie.AbiStatus
+const ABI_OK: AbiStatus = abie.ABI_OK
+
+# ----------------------------------------------------------------------------
+# IDs
+# ----------------------------------------------------------------------------
+
+type AbiTypeId = abil.AbiTypeId     # u64
+type AbiNameId = AbiU32             # 32-bit stable-ish id (hash)
+type AbiFileId = AbiU32
+type AbiMsgId  = AbiU32
+type AbiBuildId = AbiU64            # build hash/id
+
+# ----------------------------------------------------------------------------
+# Opaque handles (u64)
+# ----------------------------------------------------------------------------
+
+type AbiHandle = AbiU64
+
+type RuntimeHandle = AbiHandle
+type TaskHandle    = AbiHandle
+type TimerHandle   = AbiHandle
+type IoHandle      = AbiHandle
+type PollerHandle  = AbiHandle
+type PluginHandle  = AbiHandle
+
+# Handle tags for debugging / validation
+enum AbiHandleKind
+  Invalid = 0
+  Runtime = 1
+  Task = 2
+  Timer = 3
+  Io = 4
+  Poller = 5
+  Plugin = 6
+  Alloc = 7
+  User = 8
+.end
+
+struct AbiTaggedHandle
+  raw: AbiHandle
+  kind: AbiHandleKind
+  flags: AbiU32
+.end
+
+const ABI_HANDLE_FLAG_NONE: AbiU32 = 0
+const ABI_HANDLE_FLAG_OWNED: AbiU32 = 1 << 0
+const ABI_HANDLE_FLAG_WEAK: AbiU32  = 1 << 1
+
+fn handle_invalid() -> AbiTaggedHandle
+  ret AbiTaggedHandle raw: 0 kind: AbiHandleKind.Invalid flags: 0 .end
+.end
+
+fn handle_make(raw: AbiHandle, kind: AbiHandleKind, flags: AbiU32) -> AbiTaggedHandle
+  ret AbiTaggedHandle raw: raw kind: kind flags: flags .end
+.end
+
+fn handle_is_valid(h: AbiTaggedHandle) -> AbiBool
+  ret h.raw != 0 and h.kind != AbiHandleKind.Invalid
+.end
+
+# ----------------------------------------------------------------------------
+# Ownership markers (for pointers/slices)
+# ----------------------------------------------------------------------------
+
+enum AbiOwnership
+  Borrowed = 0
+  Owned = 1
+.end
+
+struct AbiOwnedPtr
+  ptr: abis.AbiPtr
+  ownership: AbiOwnership
+  reserved0: AbiU32
+.end
+
+fn owned_ptr(ptr: abis.AbiPtr) -> AbiOwnedPtr
+  ret AbiOwnedPtr ptr: ptr ownership: AbiOwnership.Owned reserved0: 0 .end
+.end
+
+fn borrowed_ptr(ptr: abis.AbiPtr) -> AbiOwnedPtr
+  ret AbiOwnedPtr ptr: ptr ownership: AbiOwnership.Borrowed reserved0: 0 .end
+.end
+
+# ----------------------------------------------------------------------------
+# ABI versioning / package identity
+# ----------------------------------------------------------------------------
+
+struct AbiVersion
+  major: AbiU16
+  minor: AbiU16
+  patch: AbiU16
+  reserved0: AbiU16
+.end
+
+fn abi_version(maj: AbiU16, min: AbiU16, pat: AbiU16) -> AbiVersion
+  ret AbiVersion major: maj minor: min patch: pat reserved0: 0 .end
+.end
+
+struct AbiPackageId
+  name: abis.AbiStrView       # utf8 view
+  version: AbiVersion
+  build: AbiBuildId
+  abi_version: AbiU32
+  flags: AbiU32
+.end
+
+const ABI_PKG_FLAG_DEV: AbiU32 = 1 << 0
+const ABI_PKG_FLAG_DIRTY: AbiU32 = 1 << 1
+
+# ----------------------------------------------------------------------------
+# Type/Field/Enum metadata (descriptor tables)
+# ----------------------------------------------------------------------------
+# Reuse AbiTypeDesc from abi_layout.
+type AbiTypeKind = abil.AbiTypeKind
+type AbiScalarKind = abil.AbiScalarKind
+type AbiTypeDesc = abil.AbiTypeDesc
+
+struct AbiFieldDesc
+  name_id: AbiNameId
+  type_id: AbiTypeId
+  offset: AbiU64
+  size: AbiU64
+  align: AbiU32
+  flags: AbiU32
+.end
+
+const ABI_FIELD_FLAG_PUBLIC: AbiU32 = 1 << 0
+const ABI_FIELD_FLAG_OPTIONAL: AbiU32 = 1 << 1
+
+struct AbiEnumVariantDesc
+  name_id: AbiNameId
+  tag: AbiU32
+  payload_type: AbiTypeId
+  flags: AbiU32
+.end
+
+struct AbiEnumDesc
+  type_id: AbiTypeId
+  repr_size: AbiU32      # 1/2/4/8
+  variant_count: AbiU32
+  variants_ptr: AbiU64
+  flags: AbiU32
+  reserved0: AbiU32
+.end
+
+const ABI_ENUM_FLAG_C_LIKE: AbiU32 = 1 << 0
+const ABI_ENUM_FLAG_HAS_PAYLOAD: AbiU32 = 1 << 1
+
+# ----------------------------------------------------------------------------
+# Registry tables (static views)
+# ----------------------------------------------------------------------------
+
+struct AbiTypeTableView
+  ptr: AbiU64        # *AbiTypeDesc
+  len: AbiU32
+  reserved0: AbiU32
+.end
+
+struct AbiFieldTableView
+  ptr: AbiU64        # *AbiFieldDesc
+  len: AbiU32
+  reserved0: AbiU32
+.end
+
+struct AbiEnumTableView
+  ptr: AbiU64        # *AbiEnumDesc
+  len: AbiU32
+  reserved0: AbiU32
+.end
+
+struct AbiRegistry
+  abi_version: AbiU32
+  types: AbiTypeTableView
+  fields: AbiFieldTableView
+  enums: AbiEnumTableView
+  reserved0: AbiU64
+  reserved1: AbiU64
+.end
+
+fn abi_registry_empty() -> AbiRegistry
+  ret AbiRegistry
+    abi_version: 1
+    types: AbiTypeTableView ptr: 0 len: 0 reserved0: 0 .end
+    fields: AbiFieldTableView ptr: 0 len: 0 reserved0: 0 .end
+    enums: AbiEnumTableView ptr: 0 len: 0 reserved0: 0 .end
+    reserved0: 0
+    reserved1: 0
+  .end
+.end
+
+# ----------------------------------------------------------------------------
+# Lookups (pure: pointer math not done; returns indices only)
+# ----------------------------------------------------------------------------
+# In real impl, runtime provides functions to scan table memory. Here we provide
+# "index lookup" helpers for cases where tables are mirrored in Vitte memory.
+
+struct AbiLookupU32
+  ok: AbiBool
+  index: AbiU32
+.end
+
+fn lookup_fail() -> AbiLookupU32
+  ret AbiLookupU32 ok: false index: 0 .end
+.end
+
+fn lookup_ok(i: AbiU32) -> AbiLookupU32
+  ret AbiLookupU32 ok: true index: i .end
+.end
+
+# NOTE: these lookup functions expect arrays accessible in-process.
+fn find_type_by_id(table: [AbiTypeDesc], id: AbiTypeId) -> AbiLookupU32
+  let mut i: AbiU32 = 0
+  while i < (table.len() as AbiU32)
+    if table[i].id == id
+      ret lookup_ok(i)
+    .end
+    i = i + 1
+  .end
+  ret lookup_fail()
+.end
+
+fn find_field_by_name(fields: [AbiFieldDesc], name_id: AbiNameId) -> AbiLookupU32
+  let mut i: AbiU32 = 0
+  while i < (fields.len() as AbiU32)
+    if fields[i].name_id == name_id
+      ret lookup_ok(i)
+    .end
+    i = i + 1
+  .end
+  ret lookup_fail()
+.end
+
+# ----------------------------------------------------------------------------
+# Canonical ids helpers (hashing names)
+# ----------------------------------------------------------------------------
+
+fn name_id_from_utf8(bytes: [AbiU8]) -> AbiNameId
+  ret abistr.name_id_from_utf8(bytes)
+.end
+
+fn type_id_from_name(bytes: [AbiU8]) -> AbiTypeId
+  ret abil.type_id_from_name(bytes)
+.end
+
+# ----------------------------------------------------------------------------
+# Canonical ABI types used by ray-runtime (IDs)
+# ----------------------------------------------------------------------------
+
+fn tid_abi_error() -> AbiTypeId
+  ret type_id_from_name([ 'A' as AbiU8, 'b' as AbiU8, 'i' as AbiU8, 'E' as AbiU8, 'r' as AbiU8, 'r' as AbiU8, 'o' as AbiU8, 'r' as AbiU8 ])
+.end
+
+fn tid_abi_result() -> AbiTypeId
+  ret type_id_from_name([ 'A' as AbiU8, 'b' as AbiU8, 'i' as AbiU8, 'R' as AbiU8, 'e' as AbiU8, 's' as AbiU8, 'u' as AbiU8, 'l' as AbiU8, 't' as AbiU8 ])
+.end
+
+fn tid_str_view() -> AbiTypeId
+  ret abil.tid_str_view()
+.end
+
+fn tid_slice_u8() -> AbiTypeId
+  ret abil.tid_slice_u8()
+.end
+
+fn tid_handle() -> AbiTypeId
+  ret abil.tid_handle()
+.end
+
+# ----------------------------------------------------------------------------
+# Canonical descriptor builders for these types (in-process tables)
+# ----------------------------------------------------------------------------
+
+fn build_canonical_type_table() -> [AbiTypeDesc]
+  # Minimal set + extendable.
+  let mut v: [AbiTypeDesc] = []
+
+  v.push(abil.desc_scalar(type_id_from_name([ 'u' as AbiU8, '8' as AbiU8 ]), AbiScalarKind.U8, 1, 1))
+  v.push(abil.desc_scalar(type_id_from_name([ 'u' as AbiU8, '3' as AbiU8, '2' as AbiU8 ]), AbiScalarKind.U32, 4, 4))
+  v.push(abil.desc_scalar(type_id_from_name([ 'u' as AbiU8, '6' as AbiU8, '4' as AbiU8 ]), AbiScalarKind.U64, 8, 8))
+  v.push(abil.desc_scalar(type_id_from_name([ 'i' as AbiU8, '3' as AbiU8, '2' as AbiU8 ]), AbiScalarKind.I32, 4, 4))
+  v.push(abil.desc_scalar(type_id_from_name([ 'i' as AbiU8, '6' as AbiU8, '4' as AbiU8 ]), AbiScalarKind.I64, 8, 8))
+  v.push(abil.desc_scalar(type_id_from_name([ 'b' as AbiU8, 'o' as AbiU8, 'o' as AbiU8, 'l' as AbiU8 ]), AbiScalarKind.Bool, 1, 1))
+
+  # struct str_view
+  let strl = abil.layout_str_view()
+  v.push(abil.desc_struct(tid_str_view(), strl.size, strl.align, 2, 0))
+
+  # struct handle
+  let hdl = abil.layout_handle()
+  v.push(abil.desc_struct(tid_handle(), hdl.size, hdl.align, 3, 0))
+
+  # struct AbiError (layout unknown here, keep 0; filled by runtime layout tests)
+  v.push(abil.desc_struct(tid_abi_error(), 0, 8, 0, 0))
+
+  # struct AbiResult
+  v.push(abil.desc_struct(tid_abi_result(), 0, 8, 0, 0))
+
+  ret v
+.end
+
+# ----------------------------------------------------------------------------
+# API version checks
+# ----------------------------------------------------------------------------
+
+struct AbiApiCheck
+  ok: AbiBool
+  status: AbiStatus
+  error: abie.AbiError
+  expected: AbiU32
+  got: AbiU32
+.end
+
+fn api_check_ok(ver: AbiU32) -> AbiApiCheck
+  ret AbiApiCheck ok: true status: ABI_OK error: abie.abi_error_ok() expected: ver got: ver .end
+.end
+
+fn api_check_fail(expected: AbiU32, got: AbiU32) -> AbiApiCheck
+  let e = abie.abi_error_incompat(abie.AbiErrorDomain.Plugin, expected, got, abie.MSG_PLUGIN_INCOMPAT)
+  ret AbiApiCheck ok: false status: abie.ABI_EOPNOTSUPP error: e expected: expected got: got .end
+.end
+
+fn require_api(expected: AbiU32, got: AbiU32) -> AbiApiCheck
+  if expected == got
+    ret api_check_ok(expected)
+  .end
+  ret api_check_fail(expected, got)
+.end
+
+.end
